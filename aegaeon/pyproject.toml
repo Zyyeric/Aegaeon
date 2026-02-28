@@ -1,0 +1,11 @@
+[build-system]
+requires = [
+    "setuptools >= 49.4.0",
+    "torch == 2.3.0",
+]
+build-backend = "setuptools.build_meta"
+
+
+[tool.pytest.ini_options]
+log_cli = true
+log_level = "INFO"

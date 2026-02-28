@@ -1,0 +1,5 @@
+{
+    "max_tokens": 16000,
+    "max_batch_size": 4096,
+    "max_seq_len": 4096
+}

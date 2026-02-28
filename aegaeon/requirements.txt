@@ -1,0 +1,12 @@
+matplotlib>=3.10.0
+numpy
+psutil
+ray>=2.23.0
+safetensors>=0.4.5
+scikit_learn>=1.6.0
+torch==2.3.0
+viztracer
+vllm==0.5.1
+setuptools-rust
+simpy==4.1.1
+aenum
