@@ -66,6 +66,11 @@ class DecodeDispatcher:
         self.schedulers = [
             engine.scheduler for engine in Controller.decode_engines().values()
         ]
+    
+    def reset(self):
+        for queue in self.model_queues.values():
+            queue.clear()
+
 
     def add(self, batch: BatchedRequests):
         """

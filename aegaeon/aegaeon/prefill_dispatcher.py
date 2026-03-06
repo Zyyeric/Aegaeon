@@ -68,6 +68,10 @@ class PrefillDispatcher:
             engine.scheduler for engine in Controller.prefill_engines().values()
         ]
 
+    def reset(self):
+        for queue in self.model_queues.values():
+            queue.clear()
+
     def add(self, request: Request):
         """
         Add request to the dispatcher queues, waiting to be dispatched.

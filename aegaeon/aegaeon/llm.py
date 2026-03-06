@@ -102,6 +102,12 @@ class LLMService:
             env_vars["AEGAEON_CUDA_VISIBLE_DEVICES"] = os.environ[
                 "CUDA_VISIBLE_DEVICES"
             ]
+        if "AEGAEON_ALLOC_FRACTION" in os.environ:
+            env_vars["AEGAEON_ALLOC_FRACTION"] = os.environ["AEGAEON_ALLOC_FRACTION"]
+        if "AEGAEON_GPU_MEM_GB" in os.environ:
+            env_vars["AEGAEON_GPU_MEM_GB"] = os.environ["AEGAEON_GPU_MEM_GB"]
+        if "AEGAEON_GPU_BW_GBPS" in os.environ:
+            env_vars["AEGAEON_GPU_BW_GBPS"] = os.environ["AEGAEON_GPU_BW_GBPS"]
         if "AEGAEON_LOG_FILE" in os.environ:
             env_vars["AEGAEON_LOG_FILE"] = os.environ["AEGAEON_LOG_FILE"]
 
@@ -529,6 +535,7 @@ class Controller:
                 return []
         return outputs
 
+    @staticmethod
     async def reset():
         """Reset the control plane and workers."""
         Controller._check_initialized()
@@ -536,8 +543,10 @@ class Controller:
         global _ctrl
         _ctrl._block_manager.reset()
         # TODO
-        _ctrl._prefill_dispatcher.reset()
-        _ctrl._decode_dispatcher.reset()
+        if _ctrl._prefill_dispatcher is not None:
+            _ctrl._prefill_dispatcher.reset()
+        if _ctrl._decode_dispatcher is not None:
+            _ctrl._decode_dispatcher.reset()
         for engine in _ctrl._prefill_engines.values():
             engine.reset()
         for engine in _ctrl._decode_engines.values():

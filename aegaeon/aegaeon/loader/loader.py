@@ -173,12 +173,12 @@ class QuickLoader(BaseLoader):
         if not torch.cuda.is_available():
             raise RuntimeError("No CUDA decices avaliable!")
 
-        # Monkey-patch `nn.Parameter` as `ManagedParameter`
+    
+        # Monkey-patch only torch Parameter symbols.
+        # (Mingye): Original code patch every loaded module's `Parameter` attribute:
+        # that can overwrite unrelated classes like `inspect.Parameter`which breaks Ray
         torch.nn.Parameter = ManagedParameter
         torch.nn.parameter.Parameter = ManagedParameter
-        for module in sys.modules.values():
-            if hasattr(module, "Parameter"):
-                setattr(module, "Parameter", ManagedParameter)
 
         model_cache_filename = config.model_cache_filename
         if not os.path.isfile(model_cache_filename):

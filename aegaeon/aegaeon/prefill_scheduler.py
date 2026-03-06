@@ -98,7 +98,10 @@ class PrefillScheduler(ABC):
         """
         raise NotImplementedError()
 
-
+    def reset(self) -> None:
+        self.waiting_queue.clear()
+        self.num_on_fly_request_block = 0
+        
 class PrefillStageUniBatchScheduler(PrefillScheduler):
     """
     A prefill scheduler that always form batches with one request.

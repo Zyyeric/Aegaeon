@@ -134,7 +134,9 @@ class Worker:
         self.kv_swap: torch.Tensor = torch.from_file(
             cpu_cache_filename,
             shared=True,
-            size=cpu_cache_size,
+            # `cpu_cache_size` is in bytes; for float16 mapping `size` expects
+            # number of elements.
+            size=cpu_cache_size // 2,
             dtype=torch.float16,
             device="cpu",
         )
@@ -165,9 +167,16 @@ class Worker:
         self.quick_loader = None
         if os.getenv("FAST_SWITCH") == "1":
             from aegaeon.loader import QuickLoader
-
+            alloc_fraction = float(os.environ.get("AEGAEON_ALLOC_FRACTION", "0.875"))
+            assert 0 < alloc_fraction <= 1.0, (
+                f"AEGAEON_ALLOC_FRACTION should be in (0, 1], got {alloc_fraction}"
+            )
+            device_total_memory = torch.cuda.get_device_properties(
+                self.device
+            ).total_memory
             initialize_alloc(
-                int(self.device_type.mem_capacity_in_bytes() * 70 / 80), self.device
+                int(device_total_memory * alloc_fraction),
+                self.device,
             )
             self.quick_loader = QuickLoader(self.cudart, loader_config)
         else:
@@ -302,6 +311,13 @@ class Worker:
         else:
             gc.collect()
             torch.cuda.empty_cache()
+    
+    def reset(self):
+        """Public reset API for controller/engine cleanup."""
+        self._wait_model_prefetch()
+        self.prefetch_task = None
+        self.prefetch_model = None
+        self._reset()
 
     def _wait_model_prefetch(self):
         if self.prefetch_task is not None:

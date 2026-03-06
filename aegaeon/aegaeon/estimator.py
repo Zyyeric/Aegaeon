@@ -100,7 +100,7 @@ class PrefillEstimator:
             X.append([t, s])
             y.append(_get_prefill_latency(data))
 
-        self.linreg = LinearRegression().fit(X, y)
+        self.linreg = None if len(X) == 0 else LinearRegression().fit(X, y)
 
     def predict(
         self,
@@ -118,6 +118,9 @@ class PrefillEstimator:
         return self._predict(t, s)
 
     def _predict(self, t, s) -> float:
+        if self.linreg is None:
+            # Fallback when profile data is unavailable on the current device/model.
+            return max(1e-3, 2e-5 * t + 1e-8 * s)
         return self.linreg.predict([[t, s]])[0]
 
     def test(
@@ -209,7 +212,7 @@ class DecodeEstimator:
             X.append([t, b])
             y.append(_get_decode_latency(data))
 
-        self.linreg = LinearRegression().fit(X, y)
+        self.linreg = None if len(X) == 0 else LinearRegression().fit(X, y)
 
     def predict(
         self,
@@ -227,7 +230,9 @@ class DecodeEstimator:
         return self._predict(t, b)
 
     def _predict(self, t, b) -> float:
-        return self.linreg.predict([[t, b]])[0] * 1.0
+        if self.linreg is None:
+            # Fallback when profile data is unavailable on the current device/model.
+            return max(1e-3, 2e-5 * t + 1e-4 * b)
 
     def test(
         self,

@@ -1,5 +1,6 @@
 import time
 import copy
+import os
 from typing import Callable, Optional, List
 from abc import ABC, abstractmethod
 import asyncio
@@ -216,11 +217,16 @@ class StageEngine(ABC):
         from aegaeon.estimator import cache_estimators, DecodeEstimator
         from aegaeon.models import ModelType
 
-        cache_estimators(
-            DecodeEstimator,
-            [ModelType.from_int(i) for i in range(10000, 10080)],
-            self.device_type,
-        )
+
+        est_models = []
+        for i in range(10000, 10080):
+            model = ModelType.from_int(i)
+            if model is None:
+                continue
+            # Skip synthetic aliases whose underlying model directory is absent.
+            if os.path.isdir(model.path()):
+                est_models.append(model)
+        cache_estimators(DecodeEstimator, est_models, self.device_type)
 
         # initialize distributed groups
         handlers = []
@@ -277,7 +283,7 @@ class StageEngine(ABC):
             prefetch_model_config=prefetch_model_config,
             prefetch_enable_quick_loader=prefetch_enable_quick_loader,
         )
-        # ray.get(success)
+        ray.get(success)
 
         self.model_config = model_config
 
@@ -293,7 +299,14 @@ class StageEngine(ABC):
             block_shape,
             self._remote_call_all_workers_async,
         )
-
+    
+    def reset(self):
+        self.model_config = None
+        self.tokenizer = None
+        self.scheduler.reset()
+        handlers = self._remote_call_all_workers_async("reset")
+        ray.get(handlers)
+        
     @abstractmethod
     async def start_event_loop(self):
         raise NotImplementedError()

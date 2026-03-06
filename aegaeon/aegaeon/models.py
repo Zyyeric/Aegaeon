@@ -1,5 +1,6 @@
 import importlib
 import os
+from pathlib import Path
 import torch
 from torch import nn
 from enum import Enum
@@ -13,6 +14,13 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
+
+
+def _models_root() -> Path:
+    # Default to "<repo_root>/models", where repo_root is one directory above
+    # the top-level "aegaeon" package directory.
+    default_root = Path(__file__).resolve().parents[2] / "models"
+    return Path(os.environ.get("AEGAEON_MODELS_DIR", str(default_root))).expanduser()
 
 
 class ModelType(Enum):
@@ -173,37 +181,38 @@ class ModelType(Enum):
         ][i]
 
     def path(self) -> str:
+        root = _models_root()
         if self.value >= 10000:
             return self.alias().path()
         match self:
             case ModelType.qwen_7b:
-                return "/root/models/Qwen-7B/"
+                return str(root / "Qwen-7B")
             case ModelType.qwen_7b_chat:
-                return "/root/models/Qwen-7B-Chat/"
+                return str(root / "Qwen-7B-Chat")
             case ModelType.qwen2_5_7b:
-                return "/root/models/Qwen2.5-7B-Instruct/"
+                return str(root / "Qwen2.5-7B-Instruct")
             case ModelType.llama2_7b:
-                return "/root/models/Llama-2-7b-hf/"
+                return str(root / "Llama-2-7b-hf")
             case ModelType.internlm2_5_7b_chat:
-                return "/root/models/internlm2_5-7b-chat/"
+                return str(root / "internlm2_5-7b-chat")
             case ModelType.yi1_5_6b_chat:
-                return "/root/models/Yi-1.5-6B-Chat/"
+                return str(root / "Yi-1.5-6B-Chat")
             case ModelType.qwen1_5_14b_chat:
-                return "/root/models/Qwen1.5-14B-Chat/"
+                return str(root / "Qwen1.5-14B-Chat")
             case ModelType.llama2_13b_chat:
-                return "/root/models/Llama-2-13b-chat-ms/"
+                return str(root / "Llama-2-13b-chat-ms")
             case ModelType.qwen_14b_chat:
-                return "/root/models/Qwen-14B-Chat/"
+                return str(root / "Qwen-14B-Chat")
             case ModelType.llava1_5_13b:
-                return "/root/models/llava-1.5-13b-hf/"
+                return str(root / "llava-1.5-13b-hf")
             case ModelType.qwen1_5_moe_a2_7b_chat:
-                return "/root/models/Qwen1.5-MoE-A2.7B-Chat/"
+                return str(root / "Qwen1.5-MoE-A2.7B-Chat")
             case ModelType.yi1_5_9b_chat:
-                return "/root/models/Yi-1.5-9B-Chat/"
+                return str(root / "Yi-1.5-9B-Chat")
             case ModelType.qwen2_1_5b:
-                return "/root/models/Qwen2-1.5B/"
+                return str(root / "Qwen2-1.5B")
             case ModelType.qwen2_5_72b:
-                return "/root/models/Qwen2.5-72B-Instruct/"
+                return str(root / "Qwen2.5-72B-Instruct")
             case _:
                 raise NotImplementedError(f"{self}")
 
@@ -363,7 +372,12 @@ def get_model(
         from vllm.config import MultiModalConfig
 
         extra_model_kwargs["multimodal_config"] = MultiModalConfig()
-    if model_config.model.alias() in (ModelType.qwen2_5_7b,):
+    
+    if model_config.model.alias() in (
+        ModelType.qwen2_1_5b,
+        ModelType.qwen2_5_7b,
+        ModelType.qwen2_5_72b,
+    ):        
         from vllm.config import CacheConfig
         from aegaeon.config import BLOCK_SIZE
 

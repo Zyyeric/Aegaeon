@@ -53,6 +53,17 @@ class DecodeScheduler:
             self._run()
         )
 
+    def reset(self) -> None:
+        self.round = 0
+        self.turn = 0
+        self._turn_start = None
+        self._turn_request_moved = False
+        self.decode_batches.clear()
+        self.n = []
+        self.c0 = 0
+        self.alpha = 0
+        self.loop = self._run()
+        
     def _get_block_needed(self, length: int):
         return (length + BLOCK_SIZE - 1) // BLOCK_SIZE
 
