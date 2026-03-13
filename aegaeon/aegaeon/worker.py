@@ -23,7 +23,13 @@ from vllm.distributed import (
 from vllm.utils import init_cached_hf_modules
 
 from aegaeon import ops
-from aegaeon.config import ModelConfig, ParallelConfig, QuickLoaderConfig, BLOCK_SIZE
+from aegaeon.config import (
+    ModelConfig,
+    ParallelConfig,
+    QuickLoaderConfig,
+    BLOCK_SIZE,
+    DEFAULT_GPU_MEMORY_UTILIZATION,
+)
 from aegaeon.logger import init_logger
 from aegaeon.models import get_model
 from aegaeon.request import RequestMeta
@@ -134,7 +140,7 @@ class Worker:
         self.kv_swap: torch.Tensor = torch.from_file(
             cpu_cache_filename,
             shared=True,
-            size=cpu_cache_size,
+            size=cpu_cache_size // 2,
             dtype=torch.float16,
             device="cpu",
         )
@@ -167,7 +173,11 @@ class Worker:
             from aegaeon.loader import QuickLoader
 
             initialize_alloc(
-                int(self.device_type.mem_capacity_in_bytes() * 70 / 80), self.device
+                int(
+                    self.device_type.mem_capacity_in_bytes()
+                    * DEFAULT_GPU_MEMORY_UTILIZATION
+                ),
+                self.device,
             )
             self.quick_loader = QuickLoader(self.cudart, loader_config)
         else:
@@ -244,8 +254,8 @@ class Worker:
         self._wait_model_prefetch()
         self._reset()
         self.model_config = model_config
-        self._init_cache(num_gpu_blocks)
         self._init_model(model_config, enable_quick_loader)
+        self._init_cache(num_gpu_blocks)
 
         # Submit prefetch
         if prefetch_model_config is not None:
@@ -284,12 +294,10 @@ class Worker:
         on the worker have received move-out operations, which is the control plane's
         responsibility.
         """
-        if self.model is None:
-            return
+        if self.kv_cache is not None or self.model is not None:
+            self.wait_for_all_move_out()
 
-        self.wait_for_all_move_out()
-
-        # Clear states
+        # Clear states even if model initialization failed part-way through.
         self.model_config = None
         self.kv_cache = None
         self.kv_cache_run = None
@@ -721,42 +729,53 @@ class Worker:
         Return a CUDA event for testing completion of this operation.
         """
         stream = self.swap_in_stream if is_swap_in else self.swap_out_stream
-        new_event = torch.cuda.Event(interprocess=True, enable_timing=False)
-
-        # Wait for source blocks if needed
-        self._wait_source_events(
-            cudaStream_t(stream.cuda_stream),
-            new_event,
-            request_ids,
-            source_event_handles,
-        )
-
-        # Swap
-        # NOTE: we use a hand-crafted swapping kernel (instead of vLLM's) as both the
-        # CPU and the GPU cache is shaped differently from vLLM.
-        with torch.cuda.stream(stream):
-            assert self.kv_cache.device.type == "cuda"
-            assert self.kv_swap_view.device.type == "cpu"
-            ops.swap(
-                source_block_ids,
-                target_block_ids,
-                is_swap_in,
-                self.kv_cache,
-                self.kv_swap_view,
+        num_gpu_blocks = self.kv_cache.shape[0]
+        num_cpu_blocks = self.kv_swap_view.shape[0]
+        max_source_blocks = num_cpu_blocks if is_swap_in else num_gpu_blocks
+        max_target_blocks = num_gpu_blocks if is_swap_in else num_cpu_blocks
+        if any(block < 0 or block >= max_source_blocks for block in source_block_ids):
+            raise ValueError(
+                f"swap source blocks out of range at {self}: "
+                f"source={source_block_ids}, max={max_source_blocks}, is_swap_in={is_swap_in}"
+            )
+        if any(block < 0 or block >= max_target_blocks for block in target_block_ids):
+            raise ValueError(
+                f"swap target blocks out of range at {self}: "
+                f"target={target_block_ids}, max={max_target_blocks}, is_swap_in={is_swap_in}"
             )
 
-        # Record event
-        new_event.record(stream)
+        with torch.cuda.device(self.device):
+            # Wait for source blocks if needed.
+            self._wait_source_events(
+                cudaStream_t(stream.cuda_stream),
+                request_ids,
+                source_event_handles,
+            )
+
+            # Swap.
+            # NOTE: we use a hand-crafted swapping kernel (instead of vLLM's) as both the
+            # CPU and the GPU cache is shaped differently from vLLM.
+            with torch.cuda.stream(stream):
+                assert self.kv_cache.device.type == "cuda"
+                assert self.kv_swap_view.device.type == "cpu"
+                ops.swap(
+                    source_block_ids,
+                    target_block_ids,
+                    is_swap_in,
+                    self.kv_cache,
+                    self.kv_swap_view,
+                )
+                # Swaps are treated synchronously by BlockManager.move_requests().
+                stream.synchronize()
 
         logger.info(
             f"swap requests {request_ids} ({'CPU' if is_swap_in else 'GPU'} to {'GPU' if is_swap_in else 'CPU'})"
         )
-        return reduce_cuda_event(self.cudart, new_event)
+        return True
 
     def _wait_source_events(
         self,
         stream: cudaStream_t,
-        new_event: torch.cuda.Event,
         request_ids: List[int],
         source_event_handles: List[Optional[List[ray.ObjectRef]]],
     ):
@@ -770,7 +789,7 @@ class Worker:
             event_handles = ray.get(futures)
         except Exception as e:
             logger.error(f"error getting source events; error: {e}")
-            ray.actor.exit_actor()
+            raise RuntimeError(f"failed to gather source events at {self}") from e
         i = 0
         for request_id, fut in zip(request_ids, source_event_handles):
             if fut is not None:
@@ -796,7 +815,7 @@ class Worker:
                 if not local_event:
                     self.cudart.cudaEventDestroy(event)
                 i += 1
-            self.move_event_table[request_id].append(new_event)
+            # Swaps are synchronized before returning, so no new local event is tracked.
 
     def clear_request_resource(self, request_id: int):
         """Clear the resources associated with the request."""

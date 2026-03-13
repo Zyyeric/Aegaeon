@@ -66,6 +66,7 @@ class DeviceType(Enum):
     H800 = 3
     H20 = 4
     H100 = 5
+    L4 = 6
 
     def __str__(self):
         return self.name
@@ -75,6 +76,8 @@ class DeviceType(Enum):
         s = s.lower()
         if s == "a10" or s == "nvidia a10":
             return DeviceType.A10
+        if s == "l4" or s == "nvidia l4":
+            return DeviceType.L4
         if s == "a100" or s == "nvidia a100":
             return DeviceType.A100
         if s == "v100" or s == "nvidia v100":
@@ -87,6 +90,15 @@ class DeviceType(Enum):
             return DeviceType.H100
         if s == "nvidia a100-sxm4-80gb": 
             return DeviceType.A100
+        if (
+            s == "gh200"
+            or s == "nvidia gh200"
+            or s == "nvidia gh200 120gb"
+            or s == "nvidia gh200 480gb"
+            or "gh200" in s
+            or "grace hopper" in s
+        ):
+            return DeviceType.GH200
         return None
 
     def mem_capacity_in_bytes(self):
@@ -94,6 +106,8 @@ class DeviceType(Enum):
         match self:
             case DeviceType.A10:
                 return 24 * (2**30)
+            case DeviceType.L4:
+                return 23034 * (2**20)
             case DeviceType.A100:
                 return 80 * (2**30)
             case DeviceType.V100:
@@ -104,6 +118,10 @@ class DeviceType(Enum):
                 return 80 * (2**30)
             case DeviceType.H20:
                 return 96 * (2**30)
+            case DeviceType.GH200:
+                # Default to the common single-GPU GH200 HBM size. Override with
+                # AEGAEON_GPU_MEM_GB for other GH200 variants.
+                return 96 * (2**30)
             case _:
                 raise NotImplementedError(f"mem_capacity not implemented for {self}")
 
@@ -111,6 +129,8 @@ class DeviceType(Enum):
         """GPU memory capacity in bytes."""
         match self:
             case DeviceType.A10:
+                return 32 * (2**30)
+            case DeviceType.L4:
                 return 32 * (2**30)
             case DeviceType.A100:
                 return 32 * (2**30)
@@ -122,6 +142,10 @@ class DeviceType(Enum):
                 return 32 * (2**30)
             case DeviceType.H100:
                 return 32 * (2**30)
+            case DeviceType.GH200:
+                # This is an estimate used by the scheduler only. Override with
+                # AEGAEON_GPU_BW_GBPS if you want to tune for a specific platform.
+                return 64 * (2**30)
             case _:
                 raise NotImplementedError(f"pcie_bandwidth not implemented for {self}")
 

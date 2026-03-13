@@ -172,9 +172,20 @@ class ModelType(Enum):
             ModelType.llama2_13b_chat,
         ][i]
 
+    def path_env_vars(self) -> List[str]:
+        suffix = self.name.upper()
+        return [
+            f"AEGAEON_MODEL_PATH_{suffix}",
+            f"AEGAEON_{suffix}_PATH",
+        ]
+
     def path(self) -> str:
         if self.value >= 10000:
             return self.alias().path()
+        for env_var in self.path_env_vars():
+            env_path = os.environ.get(env_var)
+            if env_path:
+                return env_path
         match self:
             case ModelType.qwen_7b:
                 return "/root/models/Qwen-7B/"
@@ -363,7 +374,7 @@ def get_model(
         from vllm.config import MultiModalConfig
 
         extra_model_kwargs["multimodal_config"] = MultiModalConfig()
-    if model_config.model.alias() in (ModelType.qwen2_5_7b,):
+    if model_config.model.alias() in (ModelType.qwen2_1_5b, ModelType.qwen2_5_7b):
         from vllm.config import CacheConfig
         from aegaeon.config import BLOCK_SIZE
 

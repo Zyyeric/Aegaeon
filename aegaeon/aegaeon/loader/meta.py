@@ -404,7 +404,10 @@ class ModelMeta:
     ):
         sharding_metas = []
         if checkpoint_config is None:
-            sharding_metas.append(ShardingMeta.from_model_path(model_path))
+            sharding_meta = ShardingMeta.from_model_path(model_path)
+            if len(sharding_meta.tensors_metas) == 0:
+                return None
+            sharding_metas.append(sharding_meta)
         else:
             for i in range(checkpoint_config.parallel_size):
                 sharding_meta = ShardingMeta.from_model_path(

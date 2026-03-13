@@ -104,6 +104,9 @@ class LLMService:
             ]
         if "AEGAEON_LOG_FILE" in os.environ:
             env_vars["AEGAEON_LOG_FILE"] = os.environ["AEGAEON_LOG_FILE"]
+        for key, value in os.environ.items():
+            if key.startswith("AEGAEON_") and key.endswith("_PATH"):
+                env_vars[key] = value
 
         # Initialize per-node
         self.nodes: List[ray.ObjectRef[Controller]] = []
@@ -529,19 +532,39 @@ class Controller:
                 return []
         return outputs
 
-    async def reset():
-        """Reset the control plane and workers."""
+    async def reset(self):
+        """Reset the control plane state after a run."""
         Controller._check_initialized()
 
         global _ctrl
         _ctrl._block_manager.reset()
-        # TODO
-        _ctrl._prefill_dispatcher.reset()
-        _ctrl._decode_dispatcher.reset()
+
+        if _ctrl._prefill_dispatcher is not None:
+            _ctrl._prefill_dispatcher.model_queues.clear()
+        if _ctrl._decode_dispatcher is not None:
+            _ctrl._decode_dispatcher.model_queues.clear()
+
         for engine in _ctrl._prefill_engines.values():
-            engine.reset()
+            engine.batches_in_pipeline.clear()
+            engine.batches_ret_futures.clear()
+            engine.scheduler.waiting_queue.clear()
+            engine.scheduler.num_on_fly_request_block = 0
+            engine.model_config = None
+            engine.tokenizer = None
+
         for engine in _ctrl._decode_engines.values():
-            engine.reset()
+            engine.batches_in_pipeline.clear()
+            engine.batches_ret_futures.clear()
+            engine.scheduler.decode_batches.clear()
+            engine.scheduler.round = 0
+            engine.scheduler.turn = 0
+            engine.scheduler._turn_start = None
+            engine.scheduler._turn_request_moved = False
+            engine.scheduler.n = []
+            engine.scheduler.c0 = 0
+            engine.scheduler.alpha = 0
+            engine.model_config = None
+            engine.tokenizer = None
 
         _ctrl._request_outputs.clear()
 

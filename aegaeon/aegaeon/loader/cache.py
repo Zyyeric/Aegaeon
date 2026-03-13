@@ -121,7 +121,9 @@ class QuickCache:
                 name, sharding_contents, checkpoint_config
             )
         else:
-            raise NotImplementedError('No *.safetensor files found.')
+            raise FileNotFoundError(
+                f"No '*.safetensors' files found under model path: {model_name}"
+            )
 
         self.cached_models[name] = ModelHandle(self.model_cache_start, model_content)
         self.cached_tokenizers[name] = get_tokenizer(name, trust_remote_code=True)

@@ -269,7 +269,7 @@ class StageEngine(ABC):
             )
         # num_gpu_blocks = 128
 
-        success = self._remote_call_all_workers_async(
+        switch_handles = self._remote_call_all_workers_async(
             "switch",
             num_gpu_blocks,
             model_config,
@@ -277,7 +277,7 @@ class StageEngine(ABC):
             prefetch_model_config=prefetch_model_config,
             prefetch_enable_quick_loader=prefetch_enable_quick_loader,
         )
-        # ray.get(success)
+        ray.get(switch_handles)
 
         self.model_config = model_config
 

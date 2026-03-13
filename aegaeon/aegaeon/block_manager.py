@@ -795,7 +795,6 @@ class BlockManager:
         swap_target_block_ids = []
         for request in requests:
             assert (
-                block_table := self.block_tables.get(request.request_id, None)
             ), f"request {request.request_id} not allocated"
             cur_location = block_table.location
             if cur_location == target_location:
@@ -845,28 +844,21 @@ class BlockManager:
                 source_event_handles,
                 is_swap_in,
             )
-            # ray.get(event_refs)
-
-            # Update the move states
-            move_event = MoveEvent(
-                next(self.event_counter),
-                swapped,
-                swap_block_shape,
-                swap_cur_location,
-                target_location,
-                swap_source_block_ids,
-                event_refs,
-            )
+            # Swaps are synchronized in Worker.swap_blocks(), so wait here and
+            # reclaim the source blocks immediately instead of relying on CUDA IPC
+            # event propagation between worker processes.
+            await asyncio.gather(*event_refs)
             if is_gpu(swap_cur_location):
-                self.move_gpu_num_blocks[swap_cur_location] += len(
-                    swap_source_block_ids
-                )
-                self.move_events_gpu[swap_cur_location].append(move_event)
+                self.gpu_free_blocks[swap_cur_location].extend(swap_source_block_ids)
             else:
-                self.move_cpu_num_blocks[swap_block_shape] += len(swap_source_block_ids)
-                self.move_events_cpu[swap_block_shape].append(move_event)
+                block_size_bytes = self._get_block_size_bytes(swap_block_shape)
+                self.cpu_free_blocks[swap_block_shape].extend(swap_source_block_ids)
+                for block in swap_source_block_ids:
+                    slab = block * block_size_bytes // self.cpu_slab_size_bytes
+                    self.cpu_slab_usage[slab] -= 1
+                self._reclaim_cpu_slabs()
             for request in swapped:
-                self.latest_events[request.request_id] = event_refs
+                self.latest_events.pop(request.request_id, None)
 
         # Migrated
         pass

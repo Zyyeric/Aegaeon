@@ -2,12 +2,31 @@
 
 from sklearn.linear_model import LinearRegression
 from typing import Tuple, Optional, List
+import math
 from pathlib import Path
 import json
 
 from aegaeon.models import ModelType
+from aegaeon.logger import init_logger
 from aegaeon.config import get_model_config
 from aegaeon.utils import DeviceType
+
+logger = init_logger(__name__)
+
+
+def _fallback_prefill_latency(total_tokens: int, squared_tokens: int) -> float:
+    return max(0.02, total_tokens * 5e-4 + squared_tokens * 2e-7)
+
+
+def _fallback_decode_latency(total_tokens: int, batch_size: int) -> float:
+    return max(0.01, total_tokens * 8e-5 + batch_size * 2e-3)
+
+
+def _safe_score(model, X, y) -> float:
+    if len(X) < 2 or len(y) < 2:
+        logger.warning("Estimator score unavailable for %s: insufficient profile samples", model)
+        return math.nan
+    return model.score(X, y)
 
 
 def _load_time_profile(
@@ -100,7 +119,15 @@ class PrefillEstimator:
             X.append([t, s])
             y.append(_get_prefill_latency(data))
 
-        self.linreg = LinearRegression().fit(X, y)
+        self.linreg = None
+        if X:
+            self.linreg = LinearRegression().fit(X, y)
+        else:
+            logger.warning(
+                "No prefill profiles found for %s on %s; using heuristic estimator",
+                model,
+                device,
+            )
 
     def predict(
         self,
@@ -118,6 +145,8 @@ class PrefillEstimator:
         return self._predict(t, s)
 
     def _predict(self, t, s) -> float:
+        if self.linreg is None:
+            return _fallback_prefill_latency(t, s)
         return self.linreg.predict([[t, s]])[0]
 
     def test(
@@ -139,10 +168,9 @@ class PrefillEstimator:
             X.append([t, s])
             y.append(_get_prefill_latency(data))
 
-        # y_pred = self.linreg.predict(X)
-        # err = np.abs(y_pred - y) / y * 100
-        # print(err)
-        return self.linreg.score(X, y)
+        if self.linreg is None:
+            return math.nan
+        return _safe_score(self.linreg, X, y)
 
 
 class DecodeEstimator:
@@ -209,7 +237,15 @@ class DecodeEstimator:
             X.append([t, b])
             y.append(_get_decode_latency(data))
 
-        self.linreg = LinearRegression().fit(X, y)
+        self.linreg = None
+        if X:
+            self.linreg = LinearRegression().fit(X, y)
+        else:
+            logger.warning(
+                "No decode profiles found for %s on %s; using heuristic estimator",
+                model,
+                device,
+            )
 
     def predict(
         self,
@@ -227,6 +263,8 @@ class DecodeEstimator:
         return self._predict(t, b)
 
     def _predict(self, t, b) -> float:
+        if self.linreg is None:
+            return _fallback_decode_latency(t, b)
         return self.linreg.predict([[t, b]])[0] * 1.0
 
     def test(
@@ -248,10 +286,9 @@ class DecodeEstimator:
             X.append([t, b])
             y.append(_get_decode_latency(data))
 
-        # y_pred = self.linreg.predict(X)
-        # err = np.abs(y_pred - y) / y * 100
-        # print(err)
-        return self.linreg.score(X, y)
+        if self.linreg is None:
+            return math.nan
+        return _safe_score(self.linreg, X, y)
 
 
 def test_prefill_estimator(
@@ -286,7 +323,15 @@ def make_estimator(
 
 def cache_estimators(cls, models: List[ModelType], device: DeviceType):
     for model in models:
-        make_estimator(cls, model, device)
+        try:
+            make_estimator(cls, model, device)
+        except Exception as exc:
+            logger.warning(
+                "Skipping estimator warmup for %s on %s: %s",
+                model,
+                device,
+                exc,
+            )
 
 
 if __name__ == "__main__":

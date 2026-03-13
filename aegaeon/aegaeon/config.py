@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 
 # Fixed block size for Aegaeon
 BLOCK_SIZE: int = 16
+DEFAULT_GPU_MEMORY_UTILIZATION: float = 72 / 96
 
 
 @dataclass
@@ -274,7 +275,7 @@ class ModelConfig:
         self,
         parallel_config: ParallelConfig = ParallelConfig(),
         device_type: "DeviceType" = DeviceType.H800,
-        memory_utilization: float = 72 / 96,
+        memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION,
         prefetch_model_config: Optional["ModelConfig"] = None,
     ) -> int:
         """

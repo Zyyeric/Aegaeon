@@ -160,6 +160,19 @@ class ManagedParameter(torch.nn.Parameter):
     #     return self.set_(src.untyped_storage()).view(src.dtype).reshape(src.shape)
 
 
+@contextlib.contextmanager
+def patch_parameter_class():
+    original_parameter = torch.nn.Parameter
+    original_parameter_module = torch.nn.parameter.Parameter
+    torch.nn.Parameter = ManagedParameter
+    torch.nn.parameter.Parameter = ManagedParameter
+    try:
+        yield
+    finally:
+        torch.nn.Parameter = original_parameter
+        torch.nn.parameter.Parameter = original_parameter_module
+
+
 class QuickLoader(BaseLoader):
     """Model loader that uses snapshots from QuickCache."""
 
@@ -172,13 +185,6 @@ class QuickLoader(BaseLoader):
             raise ValueError("QuickLoader should not be initialized.")
         if not torch.cuda.is_available():
             raise RuntimeError("No CUDA decices avaliable!")
-
-        # Monkey-patch `nn.Parameter` as `ManagedParameter`
-        torch.nn.Parameter = ManagedParameter
-        torch.nn.parameter.Parameter = ManagedParameter
-        for module in sys.modules.values():
-            if hasattr(module, "Parameter"):
-                setattr(module, "Parameter", ManagedParameter)
 
         model_cache_filename = config.model_cache_filename
         if not os.path.isfile(model_cache_filename):
@@ -217,7 +223,8 @@ class QuickLoader(BaseLoader):
         with set_default_torch_dtype(model_config.torch_dtype):
             with device:
                 model_class = get_model_architecture(model_config)[0]
-                model = model_class(config=model_config.hf_config, **extra_model_kwargs)
+                with patch_parameter_class():
+                    model = model_class(config=model_config.hf_config, **extra_model_kwargs)
                 params_dict = dict(model.named_parameters())
 
                 for name, param in params_dict.items():
