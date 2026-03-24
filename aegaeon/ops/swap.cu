@@ -36,25 +36,45 @@ void swap(
 	for (int i = 0; i < num_blocks_to_swap; i++) {
 		int64_t source_block_id = source_block_ids[i];
 		int64_t target_block_id = target_block_ids[i];
+        bool host_is_pinned = kv_swap.is_pinned();
 
 		if (is_swap_in) {
-			// Copy from CPU to GPU
-			cudaMemcpyAsync(
-				((char*)kv_cache.data_ptr()) + target_block_id * block_size_in_bytes,
-				((char*)kv_swap.data_ptr()) + source_block_id * block_size_in_bytes,
-				block_size_in_bytes,
-				cudaMemcpyHostToDevice,
-				stream
-			);
+			// Copy from CPU to GPU. Use a synchronous fallback when the shared
+			// host buffer cannot be page-locked on the current platform.
+            if (host_is_pinned) {
+			    cudaMemcpyAsync(
+				    ((char*)kv_cache.data_ptr()) + target_block_id * block_size_in_bytes,
+				    ((char*)kv_swap.data_ptr()) + source_block_id * block_size_in_bytes,
+				    block_size_in_bytes,
+				    cudaMemcpyHostToDevice,
+				    stream
+			    );
+            } else {
+			    cudaMemcpy(
+				    ((char*)kv_cache.data_ptr()) + target_block_id * block_size_in_bytes,
+				    ((char*)kv_swap.data_ptr()) + source_block_id * block_size_in_bytes,
+				    block_size_in_bytes,
+				    cudaMemcpyHostToDevice
+			    );
+            }
 		} else {
-			// Copy from GPU to CPU
-			cudaMemcpyAsync(
-				((char*)kv_swap.data_ptr()) + target_block_id * block_size_in_bytes,
-				((char*)kv_cache.data_ptr()) + source_block_id * block_size_in_bytes,
-				block_size_in_bytes,
-				cudaMemcpyDeviceToHost,
-				stream
-			);
+			// Copy from GPU to CPU.
+            if (host_is_pinned) {
+			    cudaMemcpyAsync(
+				    ((char*)kv_swap.data_ptr()) + target_block_id * block_size_in_bytes,
+				    ((char*)kv_cache.data_ptr()) + source_block_id * block_size_in_bytes,
+				    block_size_in_bytes,
+				    cudaMemcpyDeviceToHost,
+				    stream
+			    );
+            } else {
+			    cudaMemcpy(
+				    ((char*)kv_swap.data_ptr()) + target_block_id * block_size_in_bytes,
+				    ((char*)kv_cache.data_ptr()) + source_block_id * block_size_in_bytes,
+				    block_size_in_bytes,
+				    cudaMemcpyDeviceToHost
+			    );
+            }
 		}
 	}
 }

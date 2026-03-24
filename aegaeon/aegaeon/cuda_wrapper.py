@@ -174,6 +174,13 @@ class CudaRTLibrary:
     def cudaHostRegister(self, ptr: ctypes.c_void_p, size: int) -> None:
         self.CUDART_CHECK(self.funcs["cudaHostRegister"](ptr, size, 0))
 
+    def try_cudaHostRegister(self, ptr: ctypes.c_void_p, size: int) -> bool:
+        result = self.funcs["cudaHostRegister"](ptr, size, 0)
+        if result == 0:
+            return True
+        error_str = self.cudaGetErrorString(result)
+        return False
+
     def cudaFree(self, devPtr: ctypes.c_void_p) -> None:
         self.CUDART_CHECK(self.funcs["cudaFree"](devPtr))
 

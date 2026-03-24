@@ -57,8 +57,16 @@ class QuickCache:
             model_cache_filename, shared=True, size=model_cache_size, dtype=torch.uint8
         ).untyped_storage()
 
-        cudart.cudaHostRegister(ctypes.c_void_p(storage.data_ptr()), storage.nbytes())
-        assert storage.is_shared() and storage.is_pinned()
+        registered = cudart.try_cudaHostRegister(
+            ctypes.c_void_p(storage.data_ptr()), storage.nbytes()
+        )
+        if not registered:
+            logger.warning(
+                "cudaHostRegister failed for the shared model cache; "
+                "falling back to unpinned host memory. "
+                "Model cache transfers may be slower on this platform."
+            )
+        assert storage.is_shared()
 
         self.cpu_allocator = CPUAllocator(model_cache_size, storage)
         self.model_cache_start = storage.data_ptr()

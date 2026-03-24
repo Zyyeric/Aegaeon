@@ -1,3 +1,5 @@
+import os
+import math
 import torch
 from typing import Optional, List, Dict, Tuple, TYPE_CHECKING
 from functools import cached_property
@@ -12,6 +14,32 @@ if TYPE_CHECKING:
 # Fixed block size for Aegaeon
 BLOCK_SIZE: int = 16
 DEFAULT_GPU_MEMORY_UTILIZATION: float = 72 / 96
+
+
+def get_effective_gpu_memory_utilization() -> float:
+    base = float(
+        os.environ.get(
+            "AEGAEON_GPU_MEMORY_UTILIZATION", str(DEFAULT_GPU_MEMORY_UTILIZATION)
+        )
+    )
+    engines_per_gpu = max(1, int(os.environ.get("AEGAEON_ENGINES_PER_GPU", "1")))
+    return min(1.0, max(0.01, base / engines_per_gpu))
+
+
+def _get_max_model_len_override(model_name: str) -> Optional[int]:
+    candidates = [
+        f"AEGAEON_MAX_MODEL_LEN_{model_name.upper()}",
+        "AEGAEON_MAX_MODEL_LEN",
+    ]
+    for key in candidates:
+        value = os.environ.get(key)
+        if not value:
+            continue
+        parsed = int(value)
+        if parsed <= 0:
+            raise ValueError(f"{key} must be > 0, got {parsed}")
+        return parsed
+    return None
 
 
 @dataclass
@@ -213,7 +241,10 @@ class ModelConfig:
                 max_model_len = min(max_model_len, max_len_key)
         if max_model_len == float("inf"):
             raise ValueError(f"unknown max_model_len for {self.model}")
-        return max_model_len
+        override = _get_max_model_len_override(self.model.name)
+        if override is not None:
+            return min(int(max_model_len), override)
+        return int(max_model_len)
 
     def get_num_attention_heads(
         self, parallel_config: ParallelConfig = ParallelConfig()
@@ -309,7 +340,9 @@ class ModelConfig:
         #     total_size_in_bytes/(1024**3),
         #     block_size_in_bytes/(1024**3),
         # ))
-        return int(total_size_in_bytes / block_size_in_bytes)
+        max_blocks_by_memory = int(total_size_in_bytes / block_size_in_bytes)
+        max_blocks_by_length = math.ceil(self.max_model_len / BLOCK_SIZE)
+        return max(0, min(max_blocks_by_memory, max_blocks_by_length))
 
 
 @dataclass(eq=False)

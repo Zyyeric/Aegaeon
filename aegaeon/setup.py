@@ -3,7 +3,15 @@ import os
 from typing import List
 
 from setuptools import setup, Extension
-from torch.utils.cpp_extension import CUDAExtension, BuildExtension
+
+try:
+    from torch.utils.cpp_extension import CUDAExtension, BuildExtension
+except ImportError as exc:
+    raise RuntimeError(
+        "PyTorch must be installed before building Aegaeon. "
+        "On GH200/aarch64, install a CUDA-enabled PyTorch build first, "
+        "then install Aegaeon."
+    ) from exc
 
 ROOT_DIR = os.path.dirname(__file__)
 
@@ -29,6 +37,9 @@ def get_requirements() -> List[str]:
             requirements = f.read().strip().split("\n")
         resolved_requirements = []
         for line in requirements:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
             if line.startswith("-r "):
                 resolved_requirements += _read_requirements(line.split()[1])
             else:

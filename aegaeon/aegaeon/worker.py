@@ -2,6 +2,7 @@
 Adapted from distserve/worker.py.
 """
 
+import importlib
 import ray
 import ray.actor
 import torch
@@ -20,17 +21,25 @@ from vllm.distributed import (
     init_distributed_environment,
     ensure_model_parallel_initialized,
 )
-from vllm.utils import init_cached_hf_modules
 
-from aegaeon import ops
+try:
+    from vllm.utils import init_cached_hf_modules
+except ImportError:
+    # vLLM 0.11 removed this helper from vllm.utils. The import side effects
+    # it used to provide are no longer required for newer releases.
+    def init_cached_hf_modules() -> None:
+        return None
+
 from aegaeon.config import (
     ModelConfig,
     ParallelConfig,
     QuickLoaderConfig,
     BLOCK_SIZE,
     DEFAULT_GPU_MEMORY_UTILIZATION,
+    get_effective_gpu_memory_utilization,
 )
 from aegaeon.logger import init_logger
+from aegaeon.nvtx import range_ as nvtx_range
 from aegaeon.models import get_model
 from aegaeon.request import RequestMeta
 from aegaeon.allocator import initialize_alloc, get_alloc
@@ -146,9 +155,14 @@ class Worker:
         )
         self.cudart = CudaRTLibrary()
         # print(self.kv_swap.data_ptr(), self.kv_swap.nbytes)
-        self.cudart.cudaHostRegister(
+        if not self.cudart.try_cudaHostRegister(
             ctypes.c_void_p(self.kv_swap.data_ptr()), self.kv_swap.nbytes
-        )
+        ):
+            logger.warning(
+                "cudaHostRegister failed for the shared KV swap buffer; "
+                "falling back to unpinned host memory. "
+                "Swap operations will use a synchronous copy path."
+            )
 
         # CUDA streams
         # Events from these streams may be shared to other workers for synchronization
@@ -175,7 +189,7 @@ class Worker:
             initialize_alloc(
                 int(
                     self.device_type.mem_capacity_in_bytes()
-                    * DEFAULT_GPU_MEMORY_UTILIZATION
+                    * get_effective_gpu_memory_utilization()
                 ),
                 self.device,
             )
@@ -198,7 +212,10 @@ class Worker:
         )
 
     def __repr__(self):
-        return f"{self.stage} engine #{self.engine_id}, worker #{self.worker_id}|"
+        stage = getattr(self, "stage", "<uninitialized>")
+        engine_id = getattr(self, "engine_id", "?")
+        worker_id = getattr(self, "worker_id", "?")
+        return f"{stage} engine #{engine_id}, worker #{worker_id}|"
 
     def get_device_type(self) -> DeviceType:
         return self.device_type
@@ -250,12 +267,21 @@ class Worker:
         | KV Cache | Model | Prefetch Model |
         +----------+-------+----------------+
         """
-        
-        self._wait_model_prefetch()
-        self._reset()
-        self.model_config = model_config
-        self._init_model(model_config, enable_quick_loader)
-        self._init_cache(num_gpu_blocks)
+        with nvtx_range(
+            f"aegaeon.worker.switch stage={self.stage} engine={self.engine_id} "
+            f"worker={self.worker_id} model={model_config.model}"
+        ):
+            with nvtx_range("aegaeon.worker.wait_model_prefetch"):
+                self._wait_model_prefetch()
+            with nvtx_range("aegaeon.worker.reset"):
+                self._reset()
+            self.model_config = model_config
+            with nvtx_range(f"aegaeon.worker.init_model model={model_config.model}"):
+                self._init_model(model_config, enable_quick_loader)
+            with nvtx_range(
+                f"aegaeon.worker.init_cache blocks={num_gpu_blocks}"
+            ):
+                self._init_cache(num_gpu_blocks)
 
         # Submit prefetch
         if prefetch_model_config is not None:
@@ -279,12 +305,15 @@ class Worker:
                 quick_loader = None
 
             logger.info(f"prefetching {model_config.model} ({self})")
-            self.prefetch_model = get_model(
-                model_config=model_config,
-                parallel_config=self.parallel_config,
-                device=self.device,
-                quick_loader=quick_loader,
-            )
+            with nvtx_range(
+                f"aegaeon.worker.prefetch model={model_config.model} worker={self.worker_id}"
+            ):
+                self.prefetch_model = get_model(
+                    model_config=model_config,
+                    parallel_config=self.parallel_config,
+                    device=self.device,
+                    quick_loader=quick_loader,
+                )
 
     def _reset(self):
         """Reset the worker state, clearing model weights and kvcache.
@@ -294,27 +323,38 @@ class Worker:
         on the worker have received move-out operations, which is the control plane's
         responsibility.
         """
-        if self.kv_cache is not None or self.model is not None:
-            self.wait_for_all_move_out()
+        with nvtx_range("aegaeon.worker.reset_body"):
+            if self.kv_cache is not None or self.model is not None:
+                with nvtx_range("aegaeon.worker.wait_for_all_move_out"):
+                    self.wait_for_all_move_out()
 
-        # Clear states even if model initialization failed part-way through.
-        self.model_config = None
-        self.kv_cache = None
-        self.kv_cache_run = None
-        self.kv_swap_view = None
-        self.model = None
+            # Clear states even if model initialization failed part-way through.
+            self.model_config = None
+            self.kv_cache = None
+            self.kv_cache_run = None
+            self.kv_swap_view = None
+            self.model = None
 
-        # Ensure GPU memory is released
-        if os.getenv("FAST_SWITCH") == "1":
-            get_alloc().clear()
-        else:
-            gc.collect()
-            torch.cuda.empty_cache()
+            # Ensure GPU memory is released
+            if os.getenv("FAST_SWITCH") == "1":
+                with nvtx_range("aegaeon.worker.alloc_clear"):
+                    get_alloc().clear()
+            else:
+                with nvtx_range("aegaeon.worker.gc_collect"):
+                    gc.collect()
+                with nvtx_range("aegaeon.worker.empty_cache"):
+                    torch.cuda.empty_cache()
 
     def _wait_model_prefetch(self):
         if self.prefetch_task is not None:
+            waited = False
             while self.prefetch_model is None:
+                waited = True
                 time.sleep(SLEEP_WHEN_WAITING_PREFETCH)
+            if waited:
+                logger.info(
+                    f"waited for prefetched model {self.prefetch_task[0].model} ({self})"
+                )
 
     def _init_model(
         self,
@@ -326,45 +366,78 @@ class Worker:
         Loads the model weights from CPU, or wait for the prefetch to complete.
         """
         start = time.time()
-        if self.prefetch_task is None:
-            # No prefetch submitted
-            if enable_quick_loader:
-                quick_loader = self.quick_loader
-            else:
-                quick_loader = None
-            self.model = get_model(
-                model_config=model_config,
-                parallel_config=self.parallel_config,
-                device=self.device,
-                quick_loader=quick_loader,
-            )
-            how = f"directly ({self})"
-        else:
-            if self.prefetch_task[0].model != model_config.model:
-                logger.error(
-                    f"Mismatch between prefetching model {self.prefetch_task[0].model} "
-                    f"and scheduled model {model_config.model}"
+        with nvtx_range(
+            f"aegaeon.worker.init_model_body model={model_config.model} "
+            f"prefetched={int(self.prefetch_task is not None)}"
+        ):
+            if self.prefetch_task is None:
+                # No prefetch submitted
+                if enable_quick_loader:
+                    quick_loader = self.quick_loader
+                else:
+                    quick_loader = None
+                self.model = get_model(
+                    model_config=model_config,
+                    parallel_config=self.parallel_config,
+                    device=self.device,
+                    quick_loader=quick_loader,
                 )
-                raise RuntimeError()
+                how = f"directly ({self})"
+            else:
+                if self.prefetch_task[0].model != model_config.model:
+                    logger.error(
+                        f"Mismatch between prefetching model {self.prefetch_task[0].model} "
+                        f"and scheduled model {model_config.model}"
+                    )
+                    raise RuntimeError()
 
-            # Move parameters
-            alloc = get_alloc()
-            params = [param for param in self.prefetch_model.parameters()]
-            params.sort(key=lambda param: param.data_ptr())
-            for param in params:
-                new_storage = alloc.allocate(param.shape, param.dtype, raw=True)
-                new_storage.copy_(param.untyped_storage(), non_blocking=True)
-            torch.cuda.default_stream(self.device).synchronize()
+                # Move parameters
+                with nvtx_range("aegaeon.worker.init_model.prefetch_copy"):
+                    alloc = get_alloc()
+                    params = [param for param in self.prefetch_model.parameters()]
+                    params.sort(key=lambda param: param.data_ptr())
+                    for param in params:
+                        new_storage = alloc.allocate(param.shape, param.dtype, raw=True)
+                        new_storage.copy_(param.untyped_storage(), non_blocking=True)
+                    torch.cuda.default_stream(self.device).synchronize()
 
-            self.model = self.prefetch_model
-            # XXX: this order guarantees that _prefetch won't interleave
-            self.prefetch_task = None
-            self.prefetch_model = None
-            how = f"with prefetch ({self})"
+                self.model = self.prefetch_model
+                # XXX: this order guarantees that _prefetch won't interleave
+                self.prefetch_task = None
+                self.prefetch_model = None
+                how = f"with prefetch ({self})"
 
         end = time.time()
         logger.info(
             f"model {self.model_config.model} loaded {how}; elapsed: {end-start:.2f}s"
+        )
+
+    def _bind_vllm_kv_cache_if_needed(self) -> None:
+        vllm_config = getattr(self.model, "_aegaeon_vllm_config", None)
+        if vllm_config is None:
+            return
+
+        from vllm.attention.layer import Attention
+        from vllm.config import get_layers_from_vllm_config
+        from vllm.v1.worker.utils import bind_kv_cache
+
+        attn_layers = get_layers_from_vllm_config(vllm_config, Attention)
+        if not attn_layers:
+            return
+
+        layer_names = sorted(attn_layers.keys())
+        assert len(layer_names) == self.kv_cache_run.shape[0], (
+            f"Mismatch between vLLM attention layers ({len(layer_names)}) "
+            f"and Aegaeon KV cache layers ({self.kv_cache_run.shape[0]})."
+        )
+        kv_caches = {
+            layer_name: self.kv_cache_run[layer_idx]
+            for layer_idx, layer_name in enumerate(layer_names)
+        }
+        bind_kv_cache(
+            kv_caches,
+            vllm_config.compilation_config.static_forward_context,
+            [],
         )
 
     def _init_cache(
@@ -377,15 +450,18 @@ class Worker:
         The KV cache shape is (num_gpu_blocks, *kv_block_shape), where kv_block_shape
         is decided by the model and parallel setting.
         """
-        # GPU cache storage shape
-        dtype = self.model_config.torch_dtype
-        num_gpu_blocks //= self.parallel_config.pipeline_parallel_size
-        num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
-        num_layers = self.model_config.get_num_layers(self.parallel_config)
-        self.kv_block_shape = self.model_config.get_kv_block_shape(self.parallel_config)
-        # [num_block, num_layer, 2, ...]
-        self.kv_cache_shape = (num_gpu_blocks, *self.kv_block_shape)
-        self.block_size = BLOCK_SIZE
+        with nvtx_range(
+            f"aegaeon.worker.init_cache_body model={self.model_config.model}"
+        ):
+            # GPU cache storage shape
+            dtype = self.model_config.torch_dtype
+            num_gpu_blocks //= self.parallel_config.pipeline_parallel_size
+            num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
+            num_layers = self.model_config.get_num_layers(self.parallel_config)
+            self.kv_block_shape = self.model_config.get_kv_block_shape(self.parallel_config)
+            # [num_block, num_layer, 2, ...]
+            self.kv_cache_shape = (num_gpu_blocks, *self.kv_block_shape)
+            self.block_size = BLOCK_SIZE
 
         # CPU cache storage shape
         kv_block_size = prod(self.kv_block_shape)
@@ -399,15 +475,25 @@ class Worker:
         )
 
         # Running the model with vLLM requires a slightly different kvcache shape
-        self.attn_backend = get_attn_backend(
-            self.model_config.get_num_attention_heads(self.parallel_config),
-            self.model_config.head_size,
-            num_kv_heads,
-            None,
-            dtype,
-            None,
-            BLOCK_SIZE,
-        )
+        try:
+            # vLLM 0.11+ switched to a keyword-oriented selector API.
+            self.attn_backend = get_attn_backend(
+                head_size=self.model_config.head_size,
+                dtype=dtype,
+                kv_cache_dtype=None,
+                block_size=BLOCK_SIZE,
+            )
+        except TypeError:
+            # Older vLLM releases expect the legacy positional signature.
+            self.attn_backend = get_attn_backend(
+                self.model_config.get_num_attention_heads(self.parallel_config),
+                self.model_config.head_size,
+                num_kv_heads,
+                None,
+                dtype,
+                None,
+                BLOCK_SIZE,
+            )
         # [num_layer, 2, num_blocks, ...] (assuming flash-attn backend)
         kv_cache_shape_run = (
             num_layers,
@@ -441,6 +527,7 @@ class Worker:
             )
         # Permute the kv-cache tensor for vLLM: (num_blocks, num_layers, 2, ...)
         self.kv_cache_run = self.kv_cache.permute(*self.kv_perm)
+        self._bind_vllm_kv_cache_if_needed()
         logger.info(
             f"cache ({num_gpu_blocks} blocks, shape={self.kv_cache_shape}) initialized"
         )
@@ -495,45 +582,77 @@ class Worker:
             ready_mask = [True for _ in range(len(requests))]
 
         # Run forward
-        with torch.cuda.stream(self.compute_stream):
-            # Prepare model inputs
-            input_tokens, input_positions, attn_metadata = self._prepare_model_inputs(
-                [requests[i] for i, ready in enumerate(ready_mask) if ready],
-                [block_tables[i] for i, ready in enumerate(ready_mask) if ready],
-            )
+        with nvtx_range(
+            f"aegaeon.worker.step stage={self.stage} engine={self.engine_id} "
+            f"worker={self.worker_id} batch={len(requests)} blocked={int(blocked)}"
+        ):
+            with torch.cuda.stream(self.compute_stream):
+                # Prepare model inputs
+                with nvtx_range("aegaeon.worker.prepare_model_inputs"):
+                    input_tokens, input_positions, attn_metadata = self._prepare_model_inputs(
+                        [requests[i] for i, ready in enumerate(ready_mask) if ready],
+                        [block_tables[i] for i, ready in enumerate(ready_mask) if ready],
+                    )
 
-            if time_blocked and blocked:
-                start = time.time()
-                self.compute_stream.synchronize()
-                end = time.time()
-            hidden_states = self.model(
-                input_ids=input_tokens,
-                positions=input_positions,
-                kv_caches=self.kv_cache_run,
-                attn_metadata=attn_metadata,
-                intermediate_tensors=None,
-            )
-            self.compute_stream.synchronize()
+                if time_blocked and blocked:
+                    start = time.time()
+                    self.compute_stream.synchronize()
+                    end = time.time()
+                vllm_config = getattr(self.model, "_aegaeon_vllm_config", None)
+                if vllm_config is not None:
+                    from vllm.forward_context import set_forward_context
 
-            # Greedy sampling (without SamplingMetadata)
-            hidden_states = hidden_states.index_select(
-                0, attn_metadata.query_start_loc[1:] - 1
-            )
-            logits_processor = get_logits_processor(self.model)
-            logits = logits_processor._get_logits(
-                hidden_states, get_lm_head(self.model), embedding_bias=None
-            )
-            if logits is not None:
-                soft_cap = logits_processor.soft_cap
-                scale = logits_processor.scale
-                if soft_cap is not None:
-                    logits = logits / soft_cap
-                    logits = torch.tanh(logits)
-                    logits = logits * soft_cap
-                if scale != 1.0:
-                    logits *= scale
+                    with nvtx_range("aegaeon.worker.forward"):
+                        with nvtx_range("aegaeon.worker.set_forward_context"):
+                            forward_context = set_forward_context(
+                                attn_metadata=attn_metadata,
+                                vllm_config=vllm_config,
+                                virtual_engine=0,
+                                num_tokens=input_tokens.shape[0],
+                            )
+                        with forward_context:
+                            with nvtx_range("aegaeon.worker.model_call"):
+                                hidden_states = self.model(
+                                    input_ids=input_tokens,
+                                    positions=input_positions,
+                                    intermediate_tensors=None,
+                                )
+                else:
+                    with nvtx_range("aegaeon.worker.forward"):
+                        with nvtx_range("aegaeon.worker.model_call"):
+                            hidden_states = self.model(
+                                input_ids=input_tokens,
+                                positions=input_positions,
+                                kv_caches=self.kv_cache_run,
+                                attn_metadata=attn_metadata,
+                                intermediate_tensors=None,
+                            )
+                with nvtx_range("aegaeon.worker.forward_sync"):
+                    self.compute_stream.synchronize()
 
-            generated_token_ids_tensor = torch.argmax(logits, dim=-1).cpu()
+                # Greedy sampling (without SamplingMetadata)
+                with nvtx_range("aegaeon.worker.logits_and_sample"):
+                    hidden_states = hidden_states.index_select(
+                        0, attn_metadata.query_start_loc[1:] - 1
+                    )
+                    if hasattr(self.model, "compute_logits"):
+                        logits = self.model.compute_logits(hidden_states)
+                    else:
+                        logits_processor = get_logits_processor(self.model)
+                        logits = logits_processor._get_logits(
+                            hidden_states, get_lm_head(self.model), embedding_bias=None
+                        )
+                        if logits is not None:
+                            soft_cap = logits_processor.soft_cap
+                            scale = logits_processor.scale
+                            if soft_cap is not None:
+                                logits = logits / soft_cap
+                                logits = torch.tanh(logits)
+                                logits = logits * soft_cap
+                            if scale != 1.0:
+                                logits *= scale
+
+                    generated_token_ids_tensor = torch.argmax(logits, dim=-1).cpu()
 
         # Return tokens
         if time_blocked:
@@ -589,12 +708,10 @@ class Worker:
             _, tokens, seq_len, context_len = request
             is_prompt = context_len == 0
 
-            if not is_prompt:
-                # Decode
-                block_table = _block_table.copy()
-            else:
-                # Prefill (without chunked prefill)
-                block_table = []
+            # vLLM 0.11's FA3 path expects a valid page table even for prompt
+            # prefill requests, so keep the allocated block table for both
+            # prefill and decode.
+            block_table = _block_table.copy()
             block_tables.append(block_table)
 
             seq_lens.append(seq_len)
@@ -635,7 +752,7 @@ class Worker:
             pad=0,
             dtype=torch.int,
             device=self.device,
-        )
+        ).contiguous()
         assert max_query_len > 0, "query_lens: {}".format(query_lens)
 
         context_lens_tensor = torch.tensor(
@@ -665,13 +782,13 @@ class Worker:
 
         input_tokens_tensor = torch.tensor(
             input_tokens, dtype=torch.long, device=self.device
-        )
+        ).contiguous()
         input_positions_tensor = torch.tensor(
             input_positions, dtype=torch.long, device=self.device
-        )
+        ).contiguous()
         slot_mapping_tensor = torch.tensor(
             slot_mapping, dtype=torch.long, device=self.device
-        )
+        ).contiguous()
 
         logits_soft_cap = getattr(
             self.model_config.hf_config, "attn_logit_softcapping", None
@@ -683,24 +800,51 @@ class Worker:
                 " Otherwise, the output might be wrong."
             )
 
-        attn_metadata = self.attn_backend.make_metadata(
-            # Base AttentionMetadata
-            num_prefills=num_prefills,
-            slot_mapping=slot_mapping_tensor,
-            num_prefill_tokens=num_prefill_tokens,
-            num_decode_tokens=num_decode_tokens,
-            # FlashAttentionMetadata
-            seq_lens=seq_lens,
-            seq_lens_tensor=seq_lens_tensor,
-            max_query_len=max_query_len,
-            max_prefill_seq_len=max_prefill_seq_len,
-            max_decode_seq_len=max_decode_seq_len,
-            query_start_loc=query_start_loc,
-            seq_start_loc=seq_start_loc,
-            context_lens_tensor=context_lens_tensor,
-            block_tables=block_tables_tensor,
-            use_cuda_graph=False,
-        )
+        if hasattr(self.attn_backend, "make_metadata"):
+            attn_metadata = self.attn_backend.make_metadata(
+                # Base AttentionMetadata
+                num_prefills=num_prefills,
+                slot_mapping=slot_mapping_tensor,
+                num_prefill_tokens=num_prefill_tokens,
+                num_decode_tokens=num_decode_tokens,
+                # FlashAttentionMetadata
+                seq_lens=seq_lens,
+                seq_lens_tensor=seq_lens_tensor,
+                max_query_len=max_query_len,
+                max_prefill_seq_len=max_prefill_seq_len,
+                max_decode_seq_len=max_decode_seq_len,
+                query_start_loc=query_start_loc,
+                seq_start_loc=seq_start_loc,
+                context_lens_tensor=context_lens_tensor,
+                block_tables=block_tables_tensor,
+                use_cuda_graph=False,
+            )
+        else:
+            # vLLM 0.11+ moved metadata construction to backend-specific
+            # dataclasses/builders. Aegaeon only uses decoder-only flash-attn
+            # here, so we construct the minimal metadata object directly.
+            from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
+
+            attn_metadata = FlashAttentionMetadata(
+                num_actual_tokens=len(input_tokens),
+                max_query_len=max_query_len,
+                query_start_loc=query_start_loc,
+                max_seq_len=max(seq_lens),
+                seq_lens=seq_lens_tensor,
+                block_table=block_tables_tensor,
+                slot_mapping=slot_mapping_tensor,
+                use_cascade=False,
+                common_prefix_len=0,
+                cu_prefix_query_lens=None,
+                prefix_kv_lens=None,
+                suffix_kv_lens=None,
+                max_dcp_context_kv_len=None,
+                dcp_context_kv_lens=None,
+                scheduler_metadata=None,
+                prefix_scheduler_metadata=None,
+                max_num_splits=0,
+                causal=True,
+            )
 
         return (input_tokens_tensor, input_positions_tensor, attn_metadata)
 
@@ -746,27 +890,36 @@ class Worker:
 
         with torch.cuda.device(self.device):
             # Wait for source blocks if needed.
-            self._wait_source_events(
-                cudaStream_t(stream.cuda_stream),
-                request_ids,
-                source_event_handles,
-            )
+            with nvtx_range(
+                f"aegaeon.worker.swap wait_sources count={len(request_ids)} "
+                f"dir={'in' if is_swap_in else 'out'}"
+            ):
+                self._wait_source_events(
+                    cudaStream_t(stream.cuda_stream),
+                    request_ids,
+                    source_event_handles,
+                )
 
             # Swap.
             # NOTE: we use a hand-crafted swapping kernel (instead of vLLM's) as both the
             # CPU and the GPU cache is shaped differently from vLLM.
             with torch.cuda.stream(stream):
-                assert self.kv_cache.device.type == "cuda"
-                assert self.kv_swap_view.device.type == "cpu"
-                ops.swap(
-                    source_block_ids,
-                    target_block_ids,
-                    is_swap_in,
-                    self.kv_cache,
-                    self.kv_swap_view,
-                )
-                # Swaps are treated synchronously by BlockManager.move_requests().
-                stream.synchronize()
+                with nvtx_range(
+                    f"aegaeon.worker.swap kernel count={len(source_block_ids)} "
+                    f"dir={'in' if is_swap_in else 'out'}"
+                ):
+                    assert self.kv_cache.device.type == "cuda"
+                    assert self.kv_swap_view.device.type == "cpu"
+                    ops = importlib.import_module("aegaeon.ops")
+                    ops.swap(
+                        source_block_ids,
+                        target_block_ids,
+                        is_swap_in,
+                        self.kv_cache,
+                        self.kv_swap_view,
+                    )
+                    # Swaps are treated synchronously by BlockManager.move_requests().
+                    stream.synchronize()
 
         logger.info(
             f"swap requests {request_ids} ({'CPU' if is_swap_in else 'GPU'} to {'GPU' if is_swap_in else 'CPU'})"

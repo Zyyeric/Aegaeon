@@ -4,6 +4,7 @@ from typing import List, TYPE_CHECKING
 
 from aegaeon.config import get_model_config
 from aegaeon.logger import init_logger
+from aegaeon.nvtx import range_ as nvtx_range
 from aegaeon.request import Request, BatchedRequests
 from aegaeon.block_manager import BLOCK_LOCATION_CPU, BLOCK_SIZE
 
@@ -83,10 +84,13 @@ class PrefillScheduler(ABC):
     async def on_finish_requests(self, batch: BatchedRequests):
         # At the end of a prefill batch, swap out unfinished requests,
         # and decrease the on_fly counter.
-        await self.engine.block_manager.move_requests(
-            [request for request in batch.requests if not request.is_finished],
-            BLOCK_LOCATION_CPU,
-        )
+        with nvtx_range(
+            f"aegaeon.prefill_scheduler.on_finish count={len(batch.requests)}"
+        ):
+            await self.engine.block_manager.move_requests(
+                [request for request in batch.requests if not request.is_finished],
+                BLOCK_LOCATION_CPU,
+            )
         self.num_on_fly_request_block -= sum(
             [self._get_block_needed(req.get_input_len()) for req in batch.requests]
         )
@@ -117,48 +121,55 @@ class PrefillStageUniBatchScheduler(PrefillScheduler):
         """
         Get the next batch for the prefill stage and pop them from the wait_queue.
         """
-        if len(self.waiting_queue) == 0:
-            return BatchedRequests()
-
-        # NOTE: this scheduler has only uni-batches, and the previous batch is
-        # always moved-out by now, so a new request can always fit on GPU logically
-        # (assuming the GPU memory has space for at least one request).
-        if len(self.waiting_queue[0]) == 1:
-            request = self.waiting_queue.pop(0)[0]
-        else:
-            request = self.waiting_queue[0].pop(0)
-
-        # Issue engine switch if needed
-        if (
-            self.engine.model_config is None
-            or self.engine.model_config.model != request.model
+        with nvtx_range(
+            f"aegaeon.prefill_scheduler.get_next_batch engine={self.engine.engine_id}"
         ):
-            # No request is logically on a prefill engine's GPU at this
-            # time (`on_finish_requests` will issue move-outs).
-            assert self.num_on_fly_request_block == 0
+            if len(self.waiting_queue) == 0:
+                return BatchedRequests()
 
-            # Determine prefetch
-            prefetch_model = None
-            for group in self.waiting_queue:
-                if group[0].model != request.model:
-                    prefetch_model = group[0].model
-                    break
-            self.engine.switch(
-                get_model_config(request.model),
-                prefetch_model_config=get_model_config(prefetch_model),
-            )
+            # NOTE: this scheduler has only uni-batches, and the previous batch is
+            # always moved-out by now, so a new request can always fit on GPU logically
+            # (assuming the GPU memory has space for at least one request).
+            if len(self.waiting_queue[0]) == 1:
+                request = self.waiting_queue.pop(0)[0]
+            else:
+                request = self.waiting_queue[0].pop(0)
 
-        # HACK: get the correct prompt_token_ids here using tokenizer,
-        # which is not possible before. However, various other decisions
-        # already depended on the request's input token length.
-        if request.prompt is not None:
-            request.prompt_token_ids = self.engine.tokenizer.encode(request.prompt)
-            request.prompt = None
+            # Issue engine switch if needed
+            if (
+                self.engine.model_config is None
+                or self.engine.model_config.model != request.model
+            ):
+                with nvtx_range(
+                    f"aegaeon.prefill_scheduler.switch_to model={request.model}"
+                ):
+                    # No request is logically on a prefill engine's GPU at this
+                    # time (`on_finish_requests` will issue move-outs).
+                    assert self.num_on_fly_request_block == 0
 
-        next_batch = BatchedRequests([request])
-        self.num_on_fly_request_block += self._get_block_needed(request.get_input_len())
+                    # Determine prefetch
+                    prefetch_model = None
+                    for group in self.waiting_queue:
+                        if group[0].model != request.model:
+                            prefetch_model = group[0].model
+                            break
+                    self.engine.switch(
+                        get_model_config(request.model),
+                        prefetch_model_config=get_model_config(prefetch_model),
+                    )
 
-        return next_batch
+            # HACK: get the correct prompt_token_ids here using tokenizer,
+            # which is not possible before. However, various other decisions
+            # already depended on the request's input token length.
+            if request.prompt is not None:
+                with nvtx_range("aegaeon.prefill_scheduler.tokenize_prompt"):
+                    request.prompt_token_ids = self.engine.tokenizer.encode(request.prompt)
+                    request.prompt = None
+
+            next_batch = BatchedRequests([request])
+            self.num_on_fly_request_block += self._get_block_needed(request.get_input_len())
+
+            return next_batch
 
     def print_status(self):
         if len(self.waiting_queue) > 0:

@@ -6,6 +6,7 @@ from collections import deque
 from aegaeon.models import ModelType
 from aegaeon.config import get_model_config
 from aegaeon.logger import init_logger
+from aegaeon.nvtx import range_ as nvtx_range
 from aegaeon.request import Request, BatchedRequests
 from aegaeon.estimator import cache_estimators, make_estimator, DecodeEstimator
 from aegaeon.block_manager import BLOCK_LOCATION_CPU, BLOCK_SIZE
@@ -97,55 +98,62 @@ class DecodeScheduler:
 
         Optionally return prefetch model for the next turn; turn and round may be
         incremented."""
+        with nvtx_range(f"aegaeon.decode_scheduler.get_next_batch engine={self.engine.engine_id}"):
+            decision: Tuple[BatchedRequests, Optional[ModelType]] = await anext(self.loop)
+            batch, prefetch_model = decision
+            if len(batch) == 0:
+                return BatchedRequests()
 
-        decision: Tuple[BatchedRequests, Optional[ModelType]] = await anext(self.loop)
-        batch, prefetch_model = decision
-        if len(batch) == 0:
-            return BatchedRequests()
+            # Issue engine switch if needed
+            if (
+                self.engine.model_config is None
+                or self.engine.model_config.model != batch.model
+            ):
+                with nvtx_range(
+                    f"aegaeon.decode_scheduler.switch_to model={batch.model}"
+                ):
+                    # No request is logically on a decode engine's GPU at this
+                    # time (`_run` will issue move-outs at end of turns).
+                    self.engine.switch(
+                        get_model_config(batch.model),
+                        prefetch_model_config=get_model_config(prefetch_model),
+                    )
 
-        # Issue engine switch if needed
-        if (
-            self.engine.model_config is None
-            or self.engine.model_config.model != batch.model
-        ):
-            # No request is logically on a decode engine's GPU at this
-            # time (`_run` will issue move-outs at end of turns).
-            self.engine.switch(
-                get_model_config(batch.model),
-                prefetch_model_config=get_model_config(prefetch_model),
-            )
+            # Check that the batch still fits; this might not be true when
+            # a batch grows too much within its quota.
+            if not self._batch_fits_strict(batch):
+                # XXX: ..this should be rare
+                logger.info(
+                    f"({self.engine}) batch {[r.request_id for r in batch.requests]} truncated"
+                )
+                with nvtx_range("aegaeon.decode_scheduler.truncate_batch"):
+                    truncated = BatchedRequests()
+                    for i, request in enumerate(batch.requests):
+                        if not self._batch_fits(truncated, request):
+                            break
+                        truncated.add_request(request)
+                    delayed = BatchedRequests(batch.requests[i:])
+                    await self.engine.block_manager.move_requests(
+                        delayed.requests, BLOCK_LOCATION_CPU
+                    )
 
-        # Check that the batch still fits; this might not be true when
-        # a batch grows too much within its quota.
-        if not self._batch_fits_strict(batch):
-            # XXX: ..this should be rare
-            logger.info(
-                f"({self.engine}) batch {[r.request_id for r in batch.requests]} truncated"
-            )
-            truncated = BatchedRequests()
-            for i, request in enumerate(batch.requests):
-                if not self._batch_fits(truncated, request):
-                    break
-                truncated.add_request(request)
-            delayed = BatchedRequests(batch.requests[i:])
-            await self.engine.block_manager.move_requests(
-                delayed.requests, BLOCK_LOCATION_CPU
-            )
+                    # ..split the batch and adjust quota
+                    self.decode_batches.popleft()
+                    self.decode_batches.appendleft((0, delayed))
+                    self.decode_batches.appendleft((0, truncated))
+                    self._assign_quota()
+                    batch = truncated
 
-            # ..split the batch and adjust quota
-            self.decode_batches.popleft()
-            self.decode_batches.appendleft((0, delayed))
-            self.decode_batches.appendleft((0, truncated))
-            self._assign_quota()
-            batch = truncated
+            # We have the batch; issue move-in operations
+            with nvtx_range(
+                f"aegaeon.decode_scheduler.move_in count={len(batch.requests)}"
+            ):
+                request_moved = await self.engine.block_manager.move_requests(
+                    batch.requests, self.engine.engine_id
+                )
+            self._turn_request_moved = self._turn_request_moved or request_moved
 
-        # We have the batch; issue move-in operations
-        request_moved = await self.engine.block_manager.move_requests(
-            batch.requests, self.engine.engine_id
-        )
-        self._turn_request_moved = self._turn_request_moved or request_moved
-
-        return batch
+            return batch
 
     async def _run(self) -> AsyncIterable[Tuple[BatchedRequests, Optional[ModelType]]]:
         """Main execution loop."""
@@ -184,7 +192,11 @@ class DecodeScheduler:
                         if self.decode_batches[i][1].model != batch.model:
                             prefetch_model = self.decode_batches[i][1].model
                             break
-                    yield (batch, prefetch_model)
+                    with nvtx_range(
+                        f"aegaeon.decode_scheduler.turn round={self.round} turn={self.turn} "
+                        f"model={batch.model} quota={quota:.6f}"
+                    ):
+                        yield (batch, prefetch_model)
 
                     n_step += 1
                     # ..by now the batch is already stepped once; starts counting quota
@@ -203,17 +215,21 @@ class DecodeScheduler:
                     f"({self.engine}) <round {self.round}|{self.turn}> {n_step} steps; e2e {end-start:.2f}s; expected {quota:.2f}s; first-step {self._turn_start-start:.2f}s"
                 )
                 if self._turn_request_moved:
-                    await asyncio.wait(
-                        self.engine._remote_call_all_workers_async(
-                            "wait_for_all_move_in"
+                    with nvtx_range("aegaeon.decode_scheduler.wait_for_all_move_in"):
+                        await asyncio.wait(
+                            self.engine._remote_call_all_workers_async(
+                                "wait_for_all_move_in"
+                            )
                         )
-                    )
                 if len(self.decode_batches) > 1:
                     # XXX: optimization; no need to move out requests if
                     # this is the only batch.
-                    await self.engine.block_manager.move_requests(
-                        batch.requests, BLOCK_LOCATION_CPU
-                    )  # TODO: re-dispatch
+                    with nvtx_range(
+                        f"aegaeon.decode_scheduler.move_out_end_turn count={len(batch.requests)}"
+                    ):
+                        await self.engine.block_manager.move_requests(
+                            batch.requests, BLOCK_LOCATION_CPU
+                        )  # TODO: re-dispatch
                 self.turn += 1
                 self._turn_start = None
                 self._turn_request_moved = False

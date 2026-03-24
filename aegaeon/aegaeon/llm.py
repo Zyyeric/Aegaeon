@@ -7,6 +7,7 @@ import torch
 import asyncio
 import os
 import itertools
+import math
 import traceback
 import time
 import json
@@ -21,6 +22,7 @@ from aegaeon.prefill_dispatcher import PrefillDispatcher
 from aegaeon.decode_dispatcher import DecodeDispatcher
 from aegaeon.request import Request
 from aegaeon.logger import init_logger
+from aegaeon.nvtx import range_ as nvtx_range
 from aegaeon.utils import (
     Counter,
     ensure_outfile,
@@ -97,7 +99,7 @@ class LLMService:
         self.counter = Counter()
 
         # TODO: this should be a per-node setting
-        env_vars = {"FAST_SWITCH": "1"}
+        env_vars = {"FAST_SWITCH": os.environ.get("FAST_SWITCH", "1")}
         if "CUDA_VISIBLE_DEVICES" in os.environ:
             env_vars["AEGAEON_CUDA_VISIBLE_DEVICES"] = os.environ[
                 "CUDA_VISIBLE_DEVICES"
@@ -105,7 +107,7 @@ class LLMService:
         if "AEGAEON_LOG_FILE" in os.environ:
             env_vars["AEGAEON_LOG_FILE"] = os.environ["AEGAEON_LOG_FILE"]
         for key, value in os.environ.items():
-            if key.startswith("AEGAEON_") and key.endswith("_PATH"):
+            if key.startswith("AEGAEON_"):
                 env_vars[key] = value
 
         # Initialize per-node
@@ -282,7 +284,14 @@ class Controller:
         """
         pp_size = 1
         tp_size = 1
-        device_ids_list = [[i] for i in range(num_engines)]
+        num_visible_devices = torch.cuda.device_count()
+        assert num_visible_devices > 0, "No CUDA devices available"
+        # Reuse visible GPUs when there are more engines than GPUs. This allows
+        # colocating prefill and decode engines on a single-GPU node.
+        device_ids_list = [[i % num_visible_devices] for i in range(num_engines)]
+        os.environ["AEGAEON_ENGINES_PER_GPU"] = str(
+            max(1, math.ceil(num_engines / num_visible_devices))
+        )
         pg = ray.util.placement_group(
             [{"CPU": AEGAEON_WORKER_NUM_CPUS, node_id: 0.01}]
             * num_engines,  # engine_id i -> bundle i
@@ -311,7 +320,14 @@ class Controller:
             size=cpu_num_slabs * cpu_slab_size_bytes // 2,
             dtype=torch.float16,
         )
-        cudart.cudaHostRegister(ctypes.c_void_p(tensor.data_ptr()), tensor.nbytes)
+        if not cudart.try_cudaHostRegister(
+            ctypes.c_void_p(tensor.data_ptr()), tensor.nbytes
+        ):
+            logger.warning(
+                "cudaHostRegister failed for the shared CPU cache; "
+                "falling back to unpinned host memory. "
+                "Swap performance may be lower on this platform."
+            )
         return tensor
 
     @staticmethod
@@ -508,29 +524,33 @@ class Controller:
         """Sumbit and serve a new request to the node, returning its tokens."""
         SLEEP_FOR_STEP_OUTPUTS = 0.005
 
-        Controller._check_initialized()
-        outputs: List[StepOutput] = []
-        _ctrl._request_outputs[request.request_id] = outputs
+        with nvtx_range(
+            f"aegaeon.controller.serve request={request.request_id} model={request.model}"
+        ):
+            Controller._check_initialized()
+            outputs: List[StepOutput] = []
+            _ctrl._request_outputs[request.request_id] = outputs
 
-        Controller._on_new_lifetime_event(
-            request.request_id, LifetimeEvent(LifetimeEventType.Issued)
-        )
-        if _ctrl._prefill_dispatcher is None:
-            raise ValueError(
-                f"Submitting a new request to {_ctrl._node_id} which has no "
-                "prefill engine configured."
+            Controller._on_new_lifetime_event(
+                request.request_id, LifetimeEvent(LifetimeEventType.Issued)
             )
-        _ctrl._prefill_dispatcher.add(request)
+            if _ctrl._prefill_dispatcher is None:
+                raise ValueError(
+                    f"Submitting a new request to {_ctrl._node_id} which has no "
+                    "prefill engine configured."
+                )
+            with nvtx_range("aegaeon.controller.dispatch_prefill"):
+                _ctrl._prefill_dispatcher.add(request)
 
-        while True:
-            try:
-                if outputs and outputs[-1].is_finished:
-                    break
-                await asyncio.sleep(SLEEP_FOR_STEP_OUTPUTS)
-            except asyncio.CancelledError:
-                # ..exceptions should be handled by the engine
-                return []
-        return outputs
+            while True:
+                try:
+                    if outputs and outputs[-1].is_finished:
+                        break
+                    await asyncio.sleep(SLEEP_FOR_STEP_OUTPUTS)
+                except asyncio.CancelledError:
+                    # ..exceptions should be handled by the engine
+                    return []
+            return outputs
 
     async def reset(self):
         """Reset the control plane state after a run."""

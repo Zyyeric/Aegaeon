@@ -11,7 +11,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 PART=""
-MODELS="qwen2_5_7b,yi1_5_9b_chat,llama2_13b_chat"
+MODELS="llama2_7b_chat,llama2_13b_chat"
 NUM_REQUESTS=64
 PROMPT_TOKENS=512
 MAX_NEW_TOKENS=64
@@ -36,7 +36,7 @@ Usage:
 
 Core options:
   --part <name>                    Which part to run
-  --models "<csv>"                 Aegaeon model names (default: qwen2_5_7b,yi1_5_9b_chat,llama2_13b_chat)
+  --models "<csv>"                 Aegaeon model names (default: llama2_7b_chat,llama2_13b_chat)
   --results-dir <path>             Output directory (default: benchmark/results/aegaeon_concurrent_serving)
   --trace-json <path>              Trace path (default: <results-dir>/request_trace.json)
   --out-json <path>                Benchmark output path (default: <results-dir>/aegaeon_concurrent_serving.json)

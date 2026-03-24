@@ -67,6 +67,7 @@ class DeviceType(Enum):
     H20 = 4
     H100 = 5
     L4 = 6
+    GH200 = 7
 
     def __str__(self):
         return self.name

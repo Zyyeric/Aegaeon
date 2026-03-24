@@ -37,6 +37,60 @@ from aegaeon.utils import GB
 logger = init_logger(__name__)
 
 
+def _instantiate_model(
+    model_class: Type[torch.nn.Module],
+    model_config: ModelConfig,
+    extra_model_kwargs: Dict[str, object],
+) -> torch.nn.Module:
+    try:
+        return model_class(config=model_config.hf_config, **extra_model_kwargs)
+    except TypeError as exc:
+        if "unexpected keyword argument 'config'" not in str(exc):
+            raise
+
+    from vllm.config import (
+        CacheConfig as VllmCacheConfig,
+        CompilationConfig,
+        CompilationMode,
+        CUDAGraphMode,
+        ModelConfig as VllmModelConfig,
+        ParallelConfig as VllmParallelConfig,
+        VllmConfig,
+        set_current_vllm_config,
+    )
+
+    vllm_model_config = VllmModelConfig(
+        model=model_config.model.path(),
+        trust_remote_code=True,
+        dtype=model_config.torch_dtype,
+        skip_tokenizer_init=True,
+    )
+    vllm_model_config.hf_config = model_config.hf_config
+    vllm_model_config.hf_text_config = model_config.hf_text_config
+
+    kwargs = dict(extra_model_kwargs)
+    cache_config = kwargs.pop("cache_config", VllmCacheConfig())
+    kwargs.pop("multimodal_config", None)
+
+    vllm_config = VllmConfig(
+        model_config=vllm_model_config,
+        cache_config=cache_config,
+        parallel_config=VllmParallelConfig(),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.NONE,
+            backend="eager",
+            cudagraph_mode=CUDAGraphMode.NONE,
+        ),
+    )
+    vllm_config.compilation_config.mode = CompilationMode.NONE
+    vllm_config.compilation_config.backend = "eager"
+    vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    with set_current_vllm_config(vllm_config):
+        model = model_class(vllm_config=vllm_config, **kwargs)
+    setattr(model, "_aegaeon_vllm_config", vllm_config)
+    return model
+
+
 class BaseLoader(ABC):
     """Base class for model loaders."""
 
@@ -197,10 +251,16 @@ class QuickLoader(BaseLoader):
             dtype=torch.uint8,
         )
 
-        cudart.cudaHostRegister(
+        registered = cudart.try_cudaHostRegister(
             ctypes.c_void_p(model_cache.data_ptr()), model_cache.nbytes
         )
-        assert model_cache.is_shared() and model_cache.is_pinned()
+        if not registered:
+            logger.warning(
+                "cudaHostRegister failed for the shared model cache view; "
+                "falling back to unpinned host memory. "
+                "Model loading may be slower on this platform."
+            )
+        assert model_cache.is_shared()
 
         model_cache[:] = model_cache[:]
 
@@ -224,7 +284,9 @@ class QuickLoader(BaseLoader):
             with device:
                 model_class = get_model_architecture(model_config)[0]
                 with patch_parameter_class():
-                    model = model_class(config=model_config.hf_config, **extra_model_kwargs)
+                    model = _instantiate_model(
+                        model_class, model_config, extra_model_kwargs
+                    )
                 params_dict = dict(model.named_parameters())
 
                 for name, param in params_dict.items():

@@ -1,5 +1,6 @@
 import time
 import copy
+import os
 from typing import Callable, Optional, List
 from abc import ABC, abstractmethod
 import asyncio
@@ -14,11 +15,13 @@ from vllm.transformers_utils.tokenizer import (
 )
 
 from aegaeon.logger import init_logger
+from aegaeon.nvtx import range_ as nvtx_range
 from aegaeon.config import (
     ModelConfig,
     ParallelConfig,
     QuickLoaderConfig,
     BLOCK_SIZE,
+    get_effective_gpu_memory_utilization,
 )
 from aegaeon.request import (
     Request,
@@ -254,45 +257,55 @@ class StageEngine(ABC):
 
         logger.info("({}) switching to {}".format(self, model_config.model))
 
-        # Determine number of GPU blocks
-        num_gpu_blocks = model_config.get_max_num_blocks(
-            self.parallel_config,
-            self.device_type,
-            prefetch_model_config=prefetch_model_config,
-        )
+        with nvtx_range(
+            f"aegaeon.stage_engine.switch stage={self.stage} "
+            f"engine={self.engine_id} model={model_config.model}"
+        ):
+            if os.environ.get("AEGAEON_DISABLE_PREFETCH", "0") == "1":
+                prefetch_model_config = None
 
-        # Disable prefetch_model_conbencfig if it makes num_gpu_blocks too small
-        if num_gpu_blocks < max(1024, model_config.max_model_len / BLOCK_SIZE):
-            prefetch_model_config = None
+            # Determine number of GPU blocks
             num_gpu_blocks = model_config.get_max_num_blocks(
-                self.parallel_config, self.device_type
+                self.parallel_config,
+                self.device_type,
+                memory_utilization=get_effective_gpu_memory_utilization(),
+                prefetch_model_config=prefetch_model_config,
             )
-        # num_gpu_blocks = 128
 
-        switch_handles = self._remote_call_all_workers_async(
-            "switch",
-            num_gpu_blocks,
-            model_config,
-            enable_quick_loader=enable_quick_loader,
-            prefetch_model_config=prefetch_model_config,
-            prefetch_enable_quick_loader=prefetch_enable_quick_loader,
-        )
-        ray.get(switch_handles)
+            # Disable prefetch_model_conbencfig if it makes num_gpu_blocks too small
+            if num_gpu_blocks < max(1024, model_config.max_model_len / BLOCK_SIZE):
+                prefetch_model_config = None
+                num_gpu_blocks = model_config.get_max_num_blocks(
+                    self.parallel_config,
+                    self.device_type,
+                    memory_utilization=get_effective_gpu_memory_utilization(),
+                )
 
-        self.model_config = model_config
+            with nvtx_range("aegaeon.stage_engine.switch.remote_workers"):
+                switch_handles = self._remote_call_all_workers_async(
+                    "switch",
+                    num_gpu_blocks,
+                    model_config,
+                    enable_quick_loader=enable_quick_loader,
+                    prefetch_model_config=prefetch_model_config,
+                    prefetch_enable_quick_loader=prefetch_enable_quick_loader,
+                )
+                ray.get(switch_handles)
 
-        from aegaeon.llm import Controller
+            self.model_config = model_config
 
-        self.tokenizer = Controller.get_tokenizer(model_config.model.path())
+            from aegaeon.llm import Controller
 
-        # Update block manager
-        block_shape = self.model_config.get_kv_block_shape(self.parallel_config)
-        self.block_manager.register_gpu_space(
-            self.engine_id,
-            num_gpu_blocks,
-            block_shape,
-            self._remote_call_all_workers_async,
-        )
+            self.tokenizer = Controller.get_tokenizer(model_config.model.path())
+
+            # Update block manager
+            block_shape = self.model_config.get_kv_block_shape(self.parallel_config)
+            self.block_manager.register_gpu_space(
+                self.engine_id,
+                num_gpu_blocks,
+                block_shape,
+                self._remote_call_all_workers_async,
+            )
 
     @abstractmethod
     async def start_event_loop(self):
@@ -365,24 +378,30 @@ class PrefillEngine(StageEngine):
         and each request needs #pp steps in total to generate one token.
         """
         # Get the next batch from scheduler
-        dispatch_time = time.time()
-        batched_requests = self.scheduler.get_next_batch_and_pop()
+        with nvtx_range(
+            f"aegaeon.prefill.step engine={self.engine_id} "
+            f"pipeline={len(self.batches_in_pipeline)}"
+        ):
+            dispatch_time = time.time()
+            with nvtx_range("aegaeon.prefill.scheduler_next_batch"):
+                batched_requests = self.scheduler.get_next_batch_and_pop()
 
-        if len(batched_requests) == 0:
-            # ..no new batch to serve; spin
-            self.batches_in_pipeline.append(batched_requests)
-            self.batches_ret_futures.append(None)
-            await asyncio.sleep(SLEEP_WHEN_PREFILL_NO_REQUEST)
-        else:
-            logger.debug(
-                f"({self}) serving {[request.request_id for request in batched_requests.requests]} "
-                f"({sum(request.get_input_len() for request in batched_requests.requests)} tokens)"
-            )
+            if len(batched_requests) == 0:
+                # ..no new batch to serve; spin
+                self.batches_in_pipeline.append(batched_requests)
+                self.batches_ret_futures.append(None)
+                await asyncio.sleep(SLEEP_WHEN_PREFILL_NO_REQUEST)
+            else:
+                logger.debug(
+                    f"({self}) serving {[request.request_id for request in batched_requests.requests]} "
+                    f"({sum(request.get_input_len() for request in batched_requests.requests)} tokens)"
+                )
 
-            # ..allocate blocks as needed
-            await self.block_manager.allocate_blocks_batched(
-                batched_requests, self.engine_id
-            )
+                # ..allocate blocks as needed
+                with nvtx_range("aegaeon.prefill.allocate_blocks"):
+                    await self.block_manager.allocate_blocks_batched(
+                        batched_requests, self.engine_id
+                    )
 
             # ..log down the lifetime event
             for request in batched_requests.requests:
@@ -390,22 +409,23 @@ class PrefillEngine(StageEngine):
                     request.request_id, LifetimeEvent(LifetimeEventType.PrefillBegin)
                 )
 
-            # ..push the batch into pipeline
-            batched_requests.start_one_iteration(time.time())
-            self.batches_in_pipeline.append(batched_requests)
-            remote_calls = self._remote_call_all_workers_async(
-                "step",
-                [req.meta() for req in batched_requests.requests],
-                [
-                    self.block_manager.get_block_table(request.request_id).blocks
-                    for request in batched_requests.requests
-                ],
-                # time_blocked=True, # TODO: configure this
-            )
-            pp_size = self.parallel_config.pipeline_parallel_size
-            tp_size = self.parallel_config.tensor_parallel_size
-            # only the leader of the last stage return valid output, i.e., generated tokens ids
-            self.batches_ret_futures.append(remote_calls[(pp_size - 1) * tp_size])
+                # ..push the batch into pipeline
+                batched_requests.start_one_iteration(time.time())
+                self.batches_in_pipeline.append(batched_requests)
+                with nvtx_range("aegaeon.prefill.remote_step"):
+                    remote_calls = self._remote_call_all_workers_async(
+                        "step",
+                        [req.meta() for req in batched_requests.requests],
+                        [
+                            self.block_manager.get_block_table(request.request_id).blocks
+                            for request in batched_requests.requests
+                        ],
+                        # time_blocked=True, # TODO: configure this
+                    )
+                    pp_size = self.parallel_config.pipeline_parallel_size
+                    tp_size = self.parallel_config.tensor_parallel_size
+                    # only the leader of the last stage return valid output, i.e., generated tokens ids
+                    self.batches_ret_futures.append(remote_calls[(pp_size - 1) * tp_size])
 
         if len(self.batches_in_pipeline) == self.parallel_config.pipeline_parallel_size:
             # if the pipeline is full, block until the earliest batch returns
@@ -416,15 +436,17 @@ class PrefillEngine(StageEngine):
                 self.batches_ret_futures.pop(0)
             else:
                 # ..wait for the results
-                issue_time = time.time()
-                maybe_generated_tokens_ids, block_times = await self.batches_ret_futures[0]
-                step_time = time.time()
+                with nvtx_range("aegaeon.prefill.await_worker_step"):
+                    issue_time = time.time()
+                    maybe_generated_tokens_ids, block_times = await self.batches_ret_futures[0]
+                    step_time = time.time()
 
                 finished_batch = self.batches_in_pipeline[0]
                 finished_batch.finish_one_iteration(maybe_generated_tokens_ids)
 
                 # ..invoke scheduler callback (move out requests and clear states)
-                await self.scheduler.on_finish_requests(finished_batch)
+                with nvtx_range("aegaeon.prefill.scheduler_on_finish"):
+                    await self.scheduler.on_finish_requests(finished_batch)
 
                 for i, (request, maybe_new_token_id) in enumerate(zip(
                     finished_batch.requests, maybe_generated_tokens_ids
@@ -557,41 +579,48 @@ class DecodeEngine(StageEngine):
         # Get the next batch from scheduler
         #  - this may trigger move-in if some requests are not on GPU
         #  - this may also trigger move-out if the batch grows too much, or we're starting a new turn
-        dispatch_time = time.time()
-        batch = await self.scheduler.get_next_batch()
+        with nvtx_range(
+            f"aegaeon.decode.step engine={self.engine_id} "
+            f"pipeline={len(self.batches_in_pipeline)}"
+        ):
+            dispatch_time = time.time()
+            with nvtx_range("aegaeon.decode.scheduler_next_batch"):
+                batch = await self.scheduler.get_next_batch()
 
-        if len(batch) == 0:
-            self.batches_in_pipeline.append(BatchedRequests())
-            self.batches_ret_futures.append(None)
-            await asyncio.sleep(SLEEP_WHEN_DECODE_NO_REQUEST)
-        else:
-            # ..log down the lifetime event
-            for request in batch.requests:
-                self.on_new_lifetime_event_callback(
-                    request.request_id,
-                    LifetimeEvent(LifetimeEventType.DecodeBegin),
-                    True,
-                )
+            if len(batch) == 0:
+                self.batches_in_pipeline.append(BatchedRequests())
+                self.batches_ret_futures.append(None)
+                await asyncio.sleep(SLEEP_WHEN_DECODE_NO_REQUEST)
+            else:
+                # ..log down the lifetime event
+                for request in batch.requests:
+                    self.on_new_lifetime_event_callback(
+                        request.request_id,
+                        LifetimeEvent(LifetimeEventType.DecodeBegin),
+                        True,
+                    )
 
-            # ..allocate blocks as needed
-            await self.block_manager.allocate_blocks_batched(batch, self.engine_id)
+                # ..allocate blocks as needed
+                with nvtx_range("aegaeon.decode.allocate_blocks"):
+                    await self.block_manager.allocate_blocks_batched(batch, self.engine_id)
 
-            # ..push the batch into pipeline
-            batch.start_one_iteration(time.time())
-            self.batches_in_pipeline.append(batch)
-            remote_calls = self._remote_call_all_workers_async(
-                "step",
-                [req.meta() for req in batch.requests],
-                [
-                    self.block_manager.get_block_table(request.request_id).blocks
-                    for request in batch.requests
-                ],
-                # time_blocked=True, TODO: configure this
-            )
-            # only the leader of the last stage return valid output, i.e., generated tokens ids
-            pp_size = self.parallel_config.pipeline_parallel_size
-            tp_size = self.parallel_config.tensor_parallel_size
-            self.batches_ret_futures.append(remote_calls[(pp_size - 1) * tp_size])
+                # ..push the batch into pipeline
+                batch.start_one_iteration(time.time())
+                self.batches_in_pipeline.append(batch)
+                with nvtx_range("aegaeon.decode.remote_step"):
+                    remote_calls = self._remote_call_all_workers_async(
+                        "step",
+                        [req.meta() for req in batch.requests],
+                        [
+                            self.block_manager.get_block_table(request.request_id).blocks
+                            for request in batch.requests
+                        ],
+                        # time_blocked=True, TODO: configure this
+                    )
+                    # only the leader of the last stage return valid output, i.e., generated tokens ids
+                    pp_size = self.parallel_config.pipeline_parallel_size
+                    tp_size = self.parallel_config.tensor_parallel_size
+                    self.batches_ret_futures.append(remote_calls[(pp_size - 1) * tp_size])
 
         if len(self.batches_in_pipeline) == self.parallel_config.pipeline_parallel_size:
             # if the pipeline is full, block until the earliest batch returns
@@ -601,9 +630,10 @@ class DecodeEngine(StageEngine):
                 self.batches_ret_futures.pop(0)
             else:
                 # ..wait for the results
-                issue_time = time.time()
-                maybe_generated_tokens_ids, block_times = await self.batches_ret_futures[0]
-                step_time = time.time()
+                with nvtx_range("aegaeon.decode.await_worker_step"):
+                    issue_time = time.time()
+                    maybe_generated_tokens_ids, block_times = await self.batches_ret_futures[0]
+                    step_time = time.time()
 
                 finished_batch = self.batches_in_pipeline[0]
                 finished_batch.finish_one_iteration(maybe_generated_tokens_ids)

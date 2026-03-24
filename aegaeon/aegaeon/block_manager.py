@@ -11,6 +11,7 @@ from collections import deque, defaultdict
 
 from aegaeon.config import BLOCK_SIZE
 from aegaeon.logger import init_logger
+from aegaeon.nvtx import range_ as nvtx_range
 from aegaeon.request import Request, BatchedRequests
 from aegaeon.utils import Counter, CudaRTLibrary, rebuild_cuda_event, prod
 
@@ -752,10 +753,10 @@ class BlockManager:
             num_free_blocks = len(cpu_free_list)
             num_used_blocks = sum(self.cpu_slab_usage[i] for i in slabs)
             num_move_blocks = self.move_cpu_num_blocks[block_shape]
+            num_max_blocks = num_used_blocks + num_free_blocks
 
             if num_max_blocks == 0:
                 continue
-            num_max_blocks = num_used_blocks + num_free_blocks
             log_lines.append(
                 f"[cpu (shape {block_shape}, {len(slabs)} slabs)] {num_free_blocks} / {num_max_blocks} "
                 f"({num_free_blocks / num_max_blocks * 100:.2f}%) "
@@ -788,75 +789,83 @@ class BlockManager:
         - Issue swap_blocks, if the move is between CPU and GPU
         - Issue migrate_blocks, if the move is between two GPUs
         """
-        swapped: List[Request] = []
-        swap_cur_location: Optional[BlockLocation] = None
-        swap_block_shape: Optional[Tuple[int, ...]] = None
-        swap_source_block_ids = []
-        swap_target_block_ids = []
-        for request in requests:
-            assert (
-            ), f"request {request.request_id} not allocated"
-            cur_location = block_table.location
-            if cur_location == target_location:
-                continue
-            elif is_gpu(cur_location) and is_gpu(target_location):
-                raise NotImplementedError("Migration is not implemented")
-            else:
-                if swap_cur_location is not None:
-                    assert (
-                        block_table.location == swap_cur_location
-                    ), f"request {request.request_id} is on {block_table.location}; expected {swap_cur_location}"
-                if swap_block_shape is not None:
-                    assert (
-                        block_table.block_shape == swap_block_shape
-                    ), f"request {request.request_id}'s shape is not {swap_block_shape}"
-                swap_cur_location = block_table.location
-                swap_block_shape = block_table.block_shape
-                swapped.append(request)
-                # The GPU side of a swap is the user; i.e., its worker will later access the blocks
-                swap_engine_id = (
-                    target_location if is_gpu(target_location) else swap_cur_location
-                )
+        with nvtx_range(
+            f"aegaeon.block_manager.move_requests count={len(requests)} target={target_location}"
+        ):
+            swapped: List[Request] = []
+            swap_cur_location: Optional[BlockLocation] = None
+            swap_block_shape: Optional[Tuple[int, ...]] = None
+            swap_source_block_ids = []
+            swap_target_block_ids = []
+            for request in requests:
+                assert (
+                    block_table := self.block_tables.get(request.request_id, None)
+                ), f"request {request.request_id} not allocated"
+                cur_location = block_table.location
+                if cur_location == target_location:
+                    continue
+                elif is_gpu(cur_location) and is_gpu(target_location):
+                    raise NotImplementedError("Migration is not implemented")
+                else:
+                    if swap_cur_location is not None:
+                        assert (
+                            block_table.location == swap_cur_location
+                        ), f"request {request.request_id} is on {block_table.location}; expected {swap_cur_location}"
+                    if swap_block_shape is not None:
+                        assert (
+                            block_table.block_shape == swap_block_shape
+                        ), f"request {request.request_id}'s shape is not {swap_block_shape}"
+                    swap_cur_location = block_table.location
+                    swap_block_shape = block_table.block_shape
+                    swapped.append(request)
+                    # The GPU side of a swap is the user; i.e., its worker will later access the blocks
+                    swap_engine_id = (
+                        target_location if is_gpu(target_location) else swap_cur_location
+                    )
 
-                old_block_ids = block_table.blocks
-                num_blocks = len(old_block_ids)
-                new_block_ids = await self._get_free_blocks(
-                    num_blocks, target_location, swap_block_shape
-                )
-                swap_source_block_ids += old_block_ids
-                swap_target_block_ids += new_block_ids
+                    old_block_ids = block_table.blocks
+                    num_blocks = len(old_block_ids)
+                    new_block_ids = await self._get_free_blocks(
+                        num_blocks, target_location, swap_block_shape
+                    )
+                    swap_source_block_ids += old_block_ids
+                    swap_target_block_ids += new_block_ids
 
-                # Update the block table
-                block_table.blocks = new_block_ids
-                block_table.location = target_location
+                    # Update the block table
+                    block_table.blocks = new_block_ids
+                    block_table.location = target_location
 
-        # Swapping
-        if swapped:
-            is_swap_in = True if is_gpu(target_location) else False
-            source_event_handles = [
-                self.latest_events.get(request.request_id, None) for request in swapped
-            ]
-            event_refs = self.remote_callables[swap_engine_id](
-                "swap_blocks",
-                [req.request_id for req in swapped],
-                swap_source_block_ids,
-                swap_target_block_ids,
-                source_event_handles,
-                is_swap_in,
-            )
-            # Swaps are synchronized in Worker.swap_blocks(), so wait here and
-            # reclaim the source blocks immediately instead of relying on CUDA IPC
-            # event propagation between worker processes.
-            await asyncio.gather(*event_refs)
-            if is_gpu(swap_cur_location):
-                self.gpu_free_blocks[swap_cur_location].extend(swap_source_block_ids)
-            else:
-                block_size_bytes = self._get_block_size_bytes(swap_block_shape)
-                self.cpu_free_blocks[swap_block_shape].extend(swap_source_block_ids)
-                for block in swap_source_block_ids:
-                    slab = block * block_size_bytes // self.cpu_slab_size_bytes
-                    self.cpu_slab_usage[slab] -= 1
-                self._reclaim_cpu_slabs()
+            # Swapping
+            if swapped:
+                is_swap_in = True if is_gpu(target_location) else False
+                source_event_handles = [
+                    self.latest_events.get(request.request_id, None) for request in swapped
+                ]
+                with nvtx_range(
+                    f"aegaeon.block_manager.swap count={len(swapped)} "
+                    f"dir={'in' if is_swap_in else 'out'}"
+                ):
+                    event_refs = self.remote_callables[swap_engine_id](
+                        "swap_blocks",
+                        [req.request_id for req in swapped],
+                        swap_source_block_ids,
+                        swap_target_block_ids,
+                        source_event_handles,
+                        is_swap_in,
+                    )
+                    # Swaps are synchronized in Worker.swap_blocks(), so wait here and
+                    # reclaim the source blocks immediately instead of relying on CUDA IPC
+                    # event propagation between worker processes.
+                    await asyncio.gather(*event_refs)
+                if is_gpu(swap_cur_location):
+                    self.gpu_free_blocks[swap_cur_location].extend(swap_source_block_ids)
+                else:
+                    block_size_bytes = self._get_block_size_bytes(swap_block_shape)
+                    self.cpu_free_blocks[swap_block_shape].extend(swap_source_block_ids)
+                    for block in swap_source_block_ids:
+                        slab = block * block_size_bytes // self.cpu_slab_size_bytes
+                        self.cpu_slab_usage[slab] -= 1
+                    self._reclaim_cpu_slabs()
             for request in swapped:
                 self.latest_events.pop(request.request_id, None)
 

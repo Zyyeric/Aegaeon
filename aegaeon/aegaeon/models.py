@@ -31,6 +31,10 @@ class ModelType(Enum):
     yi1_5_9b_chat = 11
     qwen2_1_5b = 12
     qwen2_5_72b = 13
+    qwen3_0_6b = 14
+    qwen3_1_7b = 15
+    llama3_8b = 16
+    llama3_8b_instruct = 17
 
     synth_model_00 = 10000
     synth_model_01 = 10001
@@ -152,6 +156,18 @@ class ModelType(Enum):
             return ModelType.qwen2_1_5b
         if s in ("qwen2_5_72b", "qwen2.5-72b"):
             return ModelType.qwen2_5_72b
+        if s in ("qwen3_0_6b", "qwen3-0.6b", "qwen3_0.6b"):
+            return ModelType.qwen3_0_6b
+        if s in ("qwen3_1_7b", "qwen3-1.7b", "qwen3_1.7b"):
+            return ModelType.qwen3_1_7b
+        if s in ("llama3_8b", "llama3-8b", "meta-llama-3-8b"):
+            return ModelType.llama3_8b
+        if s in (
+            "llama3_8b_instruct",
+            "llama3-8b-instruct",
+            "meta-llama-3-8b-instruct",
+        ):
+            return ModelType.llama3_8b_instruct
 
         return default
 
@@ -215,6 +231,14 @@ class ModelType(Enum):
                 return "/root/models/Qwen2-1.5B/"
             case ModelType.qwen2_5_72b:
                 return "/root/models/Qwen2.5-72B-Instruct/"
+            case ModelType.qwen3_0_6b:
+                return "/root/models/Qwen3-0.6B/"
+            case ModelType.qwen3_1_7b:
+                return "/root/models/Qwen3-1.7B/"
+            case ModelType.llama3_8b:
+                return "/root/models/Meta-Llama-3-8B/"
+            case ModelType.llama3_8b_instruct:
+                return "/root/models/Meta-Llama-3-8B-Instruct/"
             case _:
                 raise NotImplementedError(f"{self}")
 
@@ -247,6 +271,12 @@ class ModelType(Enum):
                 return int(1.67 * (1024**3))
             case ModelType.qwen2_5_72b:
                 return int(72 * (1024**3))
+            case ModelType.qwen3_0_6b:
+                return int(0.65 * (1024**3))
+            case ModelType.qwen3_1_7b:
+                return int(1.8 * (1024**3))
+            case ModelType.llama3_8b | ModelType.llama3_8b_instruct:
+                return int(8.0 * (1024**3))
             case _:
                 raise NotImplementedError(f"{self}")
 
@@ -299,6 +329,8 @@ _GENERATION_MODELS = {
     "QWenLMHeadModel": ("qwen", "QWenLMHeadModel"),
     "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
     "Qwen2MoeForCausalLM": ("qwen2_moe", "Qwen2MoeForCausalLM"),
+    "Qwen3ForCausalLM": ("qwen3", "Qwen3ForCausalLM"),
+    "Qwen3MoeForCausalLM": ("qwen3_moe", "Qwen3MoeForCausalLM"),
     # "RWForCausalLM": ("falcon", "FalconForCausalLM"),
     # "StableLMEpochForCausalLM": ("stablelm", "StablelmForCausalLM"),
     # "StableLmForCausalLM": ("stablelm", "StablelmForCausalLM"),
@@ -374,14 +406,19 @@ def get_model(
         from vllm.config import MultiModalConfig
 
         extra_model_kwargs["multimodal_config"] = MultiModalConfig()
-    if model_config.model.alias() in (ModelType.qwen2_1_5b, ModelType.qwen2_5_7b):
+    if model_config.model.alias() in (
+        ModelType.qwen2_1_5b,
+        ModelType.qwen2_5_7b,
+        ModelType.qwen3_0_6b,
+        ModelType.qwen3_1_7b,
+    ):
         from vllm.config import CacheConfig
         from aegaeon.config import BLOCK_SIZE
 
         extra_model_kwargs["cache_config"] = CacheConfig(
             # None of these fields actually matters
             block_size=BLOCK_SIZE,
-            gpu_memory_utilization=0,
+            gpu_memory_utilization=0.01,
             swap_space=0,
             cache_dtype="auto",
         )
