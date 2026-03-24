@@ -1,0 +1,24 @@
+[build-system]
+requires = [
+    "setuptools >= 49.4.0",
+    "torch == 2.4.1",
+]
+build-backend = "setuptools.build_meta"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.pytest.ini_options]
+log_cli = true
+log_level = "INFO"
+
+[tool.uv.extra-build-dependencies]
+vllm = ["regex"]
+
